@@ -1472,60 +1472,95 @@ def _label_permite_precheck_titulo(label):
     return not (l.startswith("ao vivo") or l.startswith("series") or l.startswith("séries"))
 
 def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
-    """Processa os cards ainda nao visitados dessa leva. Em vez de confiar numa lista de
-    coordenadas 'congelada' no momento da captura, RELE a tela ao vivo antes de cada
-    clique -- se o scroll mudar de posicao por qualquer motivo entre um card e outro
-    (ex: voltar da tela de detalhe nao preservou o lugar certo), o proximo alvo e
-    recalculado certinho, em vez de clicar as cegas em coordenadas que agora apontam
-    pra outra coisa (era isso que fazia o robo clicar varias vezes no mesmo item).
-    Cards sem nome confiavel usam fingerprint visual (pHash) em vez de bounds+scroll_n
-    (que mudam a cada rolagem -- causa raiz do clique duplicado em cards sem texto)."""
-    novos     = 0
-    ys_regiao = {c["cy"] for c in cards}
+    novos = 0
+    if not cards: return 0
+    y_fileira = sorted({c["cy"] for c in cards})[0]
+    
+    # TTL reset: ao voltar do player, a UI pode ter mudado
     while True:
         root_atual = parse_xml(get_ui_xml())
-        candidatos = [c for c in coletar_cards(root_atual) if any(abs(c["cy"] - y) <= 90 for y in ys_regiao)]
-        img_tela   = tirar_screenshot() if any(c["nome"] == "???" for c in candidatos) else None
+        candidatos = [c for c in coletar_cards(root_atual) if abs(c["cy"] - y_fileira) <= 90]
+        
+        # Tirar screenshot para pHash obrigatorio de TODOS os cards visiveis (Anti-Truncamento)
+        img_tela = tirar_screenshot() if candidatos else None
+        
+        for c in candidatos:
+            c["phash"] = chave_fingerprint_card(label, c, img_tela, 0)[-1] if img_tela else "sem_img"
+            c["largura"] = bounds_coords(c["bounds"])[2] - bounds_coords(c["bounds"])[0]
 
+        # Monotonicidade: localizar ancora
+        ancora = _ancoras_horizontais.get(y_fileira)
+        
+        # Deteccao de Reset
+        if ancora:
+            ancora_vista = next((c for c in candidatos if c["phash"] == ancora["phash"] or c["nome"].strip().lower() == ancora["nome_ui"]), None)
+            if ancora_vista and ancora_vista["cx"] < ancora["cx"]:
+                log(f"  [RESET] Carrossel retrocedeu (Ancora moveu para {ancora_vista['cx']}, era {ancora['cx']}). Dando swipe...", "WARN")
+                swipe_left(y=y_fileira, x_start=900, x_end=200)
+                continue # Re-le a tela
+        
         card_alvo, chave_alvo = None, None
+        
         for card in candidatos:
-            if card["nome"] == "???":
-                ocr_nome = ler_nome_por_ocr(card["bounds"], img_tela)
-                if ocr_nome:
-                    log(f"  [OCR] Card lido por imagem: {ocr_nome}", "NAV")
-                    card["nome"] = ocr_nome
-
             nome_key = card["nome"].strip().lower()
-            if nome_key and nome_key != "???":
-                if _label_permite_precheck_titulo(label):
-                    base_key = chave_nome_normalizada(nome_key)
-                    if len(base_key) >= 8 and base_key in nomes_base_salvos:
-                        continue  # titulo ja capturado antes (em outra sub-aba/carrossel) -- pula sem clicar
-                chave = ("card", label, nome_key, card["rid"])
-            else:
-                chave = chave_fingerprint_card(label, card, img_tela, scroll_n)
-
-            if foi_visitado(chave):
+            nome_limpo = limpar_nome_sem_qualidade(nome_key)
+            
+            # Anti-Borda: ignora cards muito estreitos (<90% ou <120px)
+            if card["largura"] < 120:
                 continue
+                
+            # Identidade Dupla (Nome + pHash) para o ledger
+            chave = ("card", label, nome_limpo, card["phash"])
+            
+            # Checagem de Monotonicidade (nunca ir para a esquerda da ancora)
+            if ancora and card["cx"] <= ancora["cx"]:
+                continue
+                
+            if foi_visitado(chave):
+                # Extra-checagem pre-fetch se o ledger so tem o nome sem o pHash
+                continue
+                
+            # Verifica precheck do titulo global se o nome for grande o suficiente e nao truncado
+            if nome_limpo and nome_limpo != "???" and not nome_key.endswith("..."):
+                if _label_permite_precheck_titulo(label):
+                    bkey = chave_nome_normalizada(nome_limpo)
+                    if len(bkey) >= 8 and bkey in nomes_base_salvos:
+                        # Log debug
+                        log(f"  [PULO] Titulo '{nome_limpo}' ja na base.", "NAV")
+                        continue
+                        
+            # Se chegou aqui, e alvo valido!
+            if card["nome"] == "???":
+                ocr = ler_nome_por_ocr(card["bounds"], img_tela)
+                if ocr:
+                    card["nome"] = ocr
+
             card_alvo, chave_alvo = card, chave
             break
 
         if card_alvo is None:
-            break  # nenhum card novo nessa faixa de tela -- acabou
+            break
 
         if not app_saudavel_ou_recuperado():
-            raise AppCrashError(f"App nao respondia antes de abrir '{card_alvo['nome']}' (aba '{label}')")
+            raise AppCrashError(f"App crash na aba '{label}'")
 
         marcar_em_processo(chave_alvo)
         novos += 1
+        
+        # Atualiza Ancora
+        _ancoras_horizontais[y_fileira] = {
+            "cx": card_alvo["cx"],
+            "phash": card_alvo["phash"],
+            "nome_ui": card_alvo["nome"].strip().lower()
+        }
+        
         processar_item(card_alvo)
-        # processar_item ja tenta voltar pra lista via BOTAO BACK (preserva o scroll).
-        # So tateia a aba como ultimo recurso se realmente ficou preso em outra tela.
+        
         if detectar_tela(parse_xml(get_ui_xml())) != "lista":
             tap(tap_x, tap_y, delay=1.5)
         marcar_concluido(chave_alvo)
+        
     return novos
-
 def _linhas_do_snapshot(cards, tolerancia=90):
     """Agrupa os cards visiveis por fileira (carrossel), retornando o Y de cada uma."""
     ys = sorted({c["cy"] for c in cards})
