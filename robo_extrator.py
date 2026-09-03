@@ -43,6 +43,7 @@ try:
 except ImportError:
     OCR_DISPONIVEL = False
 OCR_METRICAS = {"tentativas": 0, "sucessos": 0}
+_TIMEOUTS_AUDIO_SEGUIDOS = 0
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURACOES
@@ -1739,9 +1740,16 @@ def _rodar_aba_resiliente(chave):
 # ══════════════════════════════════════════════════════════════════════════════
 #  RELATORIO FINAL
 # ══════════════════════════════════════════════════════════════════════════════
-def imprimir_relatorio(duracao):
+def imprimir_relatorio(duracao, modo_noturno=False):
     total = sum(stats.values())
     mins  = duracao // 60
+    segs  = duracao % 60
+    if modo_noturno:
+        errs = len(_erros_sessao)
+        detalhes = ", ".join([f"{k}: {v}" for k,v in stats.items()])
+        log(f"[MODO NOTURNO] {total} capturados | {detalhes} | {mins}m {segs}s | Erros: {errs}", "OK")
+        return
+
     segs  = duracao % 60
     sep   = "=" * 62
     log(f"\n{sep}", "OK")
@@ -1843,6 +1851,10 @@ if __name__ == "__main__":
         help=("Quais abas processar (padrao: todas). Ex: --abas filmes | --abas ao_vivo filmes series\n"
               "Util pra atualizar so uma categoria sem reprocessar tudo de novo (URLs ja salvas sao puladas)."),
     )
+    _parser.add_argument(
+        "--modo-noturno", action="store_true",
+        help="Relatorio extremamente compacto ao final. Requer Desktops Virtuais ou nao minimizar."
+    )
     args = _parser.parse_args()
     abas_selecionadas = list(ABAS_DISPONIVEIS.keys()) if "todas" in args.abas else args.abas
 
@@ -1899,5 +1911,5 @@ if __name__ == "__main__":
         log("\nParado pelo usuario (Ctrl+C).", "WARN")
     finally:
         duracao = int(time.time() - t_inicio)
-        imprimir_relatorio(duracao)
+        imprimir_relatorio(duracao, args.modo_noturno)
         input("\nPressione Enter para sair...")

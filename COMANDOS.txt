@@ -1,224 +1,43 @@
-================================================================================
- COMANDOS DO PROJETO - "Script pegar canais"
- Guia rapido de tudo que da pra rodar e pra que serve cada coisa.
-================================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# MANUAL DE OPERAÇÃO DO ROBÔ EXTRATOR (v7.2)
+# ══════════════════════════════════════════════════════════════════════════════
 
-Pasta do projeto (rode tudo dentro dela):
-    d:\Programas Eng.Reversa\Script pegar canais
+# OPERAÇÃO PADRÃO
+Para iniciar a extração normal em todas as abas:
+> python robo_extrator.py
 
-Antes de qualquer comando, ative o ambiente virtual (uma vez por terminal aberto):
-    venv\Scripts\activate          (cmd.exe)
-    ou
-    source .venv/Scripts/activate  (Git Bash / MINGW64, como voce ja usa)
+Para retomar ou isolar apenas abas específicas:
+> python robo_extrator.py --abas filmes series
 
-Nao precisa rodar nada "como administrador" no dia a dia. So abra o terminal
-como administrador SE o ADB nao conseguir enxergar o emulador (erro de
-permissao/driver) - nesse caso feche o terminal, abra de novo com
-"Executar como administrador" e tente de novo.
+# ══════════════════════════════════════════════════════════════════════════════
+# O MODO NOTURNO (OPERAÇÃO DESASSISTIDA / FANTASMA)
+# ══════════════════════════════════════════════════════════════════════════════
+Se você precisa usar o computador enquanto o robô varre o catálogo, siga os passos:
 
---------------------------------------------------------------------------------
- 1) ROBO PRINCIPAL - captura os links do app (uso do dia a dia)
---------------------------------------------------------------------------------
-Arquivo: robo_extrator.py
+1. LIBERAR O MOUSE FÍSICO
+   No LDPlayer, vá nas Configurações (ícone da engrenagem na barra lateral).
+   Procure por opções de Atalhos ou "Mouse Passthrough" (Ocultar/Travar Mouse).
+   Desative qualquer opção que sincronize o cursor do Windows com o toque da tela.
+   O robô não usa seu mouse, ele injeta sinais via ADB! O roubo de cursor é só uma 
+   ferramenta para "Gamers" do LDPlayer.
 
-O que faz:
-    Abre e navega sozinho dentro do app "Every Cine" no emulador (via ADB),
-    clicando em todas as categorias/abas, rolando telas (vertical e horizontal),
-    entrando em series e episodios, e capturando os links de video por memory
-    dump (sem precisar de proxy). Ja identifica o nome via OCR quando precisa,
-    busca o titulo certinho no TMDB (se configurado), organiza tudo em grupos
-    (group-title) e grava:
-        Log/Filmes.m3u
-        Log/Series.m3u
-        Log/Canais_AoVivo.m3u
-        Log/Infantil.m3u
-        Log/Outros.m3u
-        Log/catalogo.jsonl        (banco de dados interno, usado pra montar a lista final)
-        Log/estado_visitados.jsonl (lembra o que ja foi visitado, pra nao repetir)
-        Log/sessao_AAAAMMDD_HHMMSS.txt (log detalhado de cada execucao)
+2. MINIMIZAR A JANELA
+   Abra o "Every Cine" e inicie a execução do script com a flag:
+   > python robo_extrator.py --modo-noturno
+   
+   Você pode simplesmente **minimizar a janela do LDPlayer** na barra de tarefas.
+   O áudio continuará tocando e o robô continuará fotografando a memória de vídeo sem 
+   nenhum pixel piscar na sua tela principal.
 
-Pre-requisitos:
-    - LDPlayer aberto e com o app "Every Cine" instalado.
-    - ADB no PATH do Windows (platform-tools) e o emulador conectado
-      (o proprio script confere "adb devices" e avisa se nao achar).
+3. O RESULTADO COMPACTO
+   Usar a flag `--modo-noturno` faz com que o robô não polua o seu terminal com um 
+   relatório gigantesco de dezenas de linhas ao final da execução. Ele imprimirá 
+   apenas uma linha única verde com o super-resumo:
+   [MODO NOTURNO] 1450 capturados | Filmes: 800, Series: 650 | 145m 30s | Erros: 0
 
-Como rodar (roda TODAS as abas, do jeito de sempre):
-    python robo_extrator.py
-
-Rodar so ALGUMAS abas (util pra atualizar uma categoria sem reprocessar
-tudo de novo - por exemplo, depois de 1 mes voce quer so atualizar os
-Filmes, sem mexer em Ao Vivo/Series/Infantil que ja estao ok):
-    python robo_extrator.py --abas filmes
-    python robo_extrator.py --abas ao_vivo
-    python robo_extrator.py --abas series
-    python robo_extrator.py --abas infantil
-    python robo_extrator.py --abas inicio
-    python robo_extrator.py --abas ao_vivo filmes series   (varias de uma vez)
-    python robo_extrator.py --abas todas                   (igual a nao passar nada)
-
-Importante: rodar so uma aba NAO apaga nem mexe nas outras categorias - o
-robo so entra na(s) aba(s) escolhida(s). URLs ja salvas continuam sendo
-puladas normalmente (nao duplica).
-
-Sistema de qualidade automatico:
-    Quando o app mostra a mesma midia em qualidades diferentes (SD, HD,
-    FHD, 4K), o robo detecta isso pelo nome/URL e guarda TODAS as
-    qualidades encontradas como entradas separadas (ex: "Filme X [4K]",
-    "Filme X [HD]", "Filme X [SD]") - nem todo mundo tem internet boa
-    pra assistir em HD/4K, entao nada e descartado. So bloqueia se a
-    MESMA qualidade do MESMO titulo ja tiver sido salva antes (evita
-    duplicata de verdade). Na playlist final, as qualidades do mesmo
-    titulo ficam agrupadas e ordenadas da melhor pra pior (4K, FHD, HD,
-    SD), pra facilitar escolher. Isso NAO se aplica a canais de Ao Vivo
-    (cada variante de canal e tratada como uma entrada separada de
-    proposito, sempre).
-
-Opcional (melhora os nomes salvos, nao e obrigatorio):
-    Definir a chave da API do TMDB antes de rodar, pra ele conseguir
-    normalizar nomes de filme/serie (ano, titulo oficial em PT-BR):
-        (Git Bash)  export TMDB_API_KEY="sua_chave_aqui"
-        (cmd.exe)   set TMDB_API_KEY=sua_chave_aqui
-    Sem isso, o robo funciona normalmente, so nao vai buscar o titulo no TMDB.
-
-Pra parar: Ctrl+C no terminal (ele salva tudo incrementalmente, entao nao
-perde progresso mesmo parando no meio).
-
---------------------------------------------------------------------------------
- 2) GERAR A PLAYLIST FINAL UNICA (rodar depois de capturar)
---------------------------------------------------------------------------------
-Arquivo: gerar_playlist_final.py
-
-O que faz:
-    Junta tudo que ja foi capturado (Log/catalogo.jsonl + os .m3u por
-    categoria, incluindo entradas antigas) numa UNICA playlist, ja organizada
-    por grupo (canal, serie com temporada/episodio, filme, etc):
-        Log/playlist_completa.m3u
-
-Pre-requisito:
-    Ja ter rodado o robo_extrator.py pelo menos uma vez (precisa ter algo
-    em Log/ pra juntar).
-
-Como rodar:
-    python gerar_playlist_final.py
-
-Rode de novo sempre que quiser atualizar a lista final depois de capturar
-mais conteudo. E seguro rodar quantas vezes quiser.
-
---------------------------------------------------------------------------------
- 3) PEGAR O LINK DA PLAYLIST (pra usar no app de IPTV)
---------------------------------------------------------------------------------
-Arquivo: servir_playlist.py
-
-O que faz:
-    Sobe um servidor local que disponibiliza a pasta Log/ na rede, gerando
-    um link tipo:
-        http://192.168.x.x:8765/playlist_completa.m3u
-    Esse link pode ser colocado direto no campo "URL da lista M3U" de
-    qualquer app de IPTV (TiviMate, IPTV Smarters, Perfect Player, Smart TV,
-    celular, TV Box), desde que o aparelho esteja na MESMA rede Wi-Fi
-    deste PC.
-
-Pre-requisito:
-    Ja ter rodado o gerar_playlist_final.py pelo menos uma vez.
-
-Como rodar:
-    python servir_playlist.py                 (porta padrao 8765)
-    python servir_playlist.py 9000             (pra usar outra porta)
-
-Observacoes:
-    - Deixe a janela do terminal aberta enquanto for assistir (o servidor
-      precisa continuar rodando). Ctrl+C pra parar.
-    - Se o Windows perguntar se permite o Python acessar a rede
-      (Firewall do Windows), clique em "Permitir".
-    - So funciona dentro de casa/mesma rede. Pra acessar de fora, seria
-      preciso configurar redirecionamento de porta no roteador ou um
-      servico tipo ngrok (nao configurado neste projeto).
-
---------------------------------------------------------------------------------
- 4) MIGRAR DADOS ANTIGOS PRO FORMATO NOVO (uso pontual, so se precisar)
---------------------------------------------------------------------------------
-Arquivo: migrar_legado.py
-
-O que faz:
-    Rele qualquer .m3u que ainda esteja no formato ANTIGO (sem group-title,
-    de antes do sistema de categorizacao por nome ter sido criado) e
-    reprocessa cada entrada pelo pipeline atual do robo_extrator.py -
-    corrige categoria errada (ex: serie que tinha sido salva como filme),
-    extrai temporada/episodio do nome, aplica o group-title certo e o
-    controle de melhor-qualidade. Os arquivos originais NAO sao apagados,
-    ficam guardados como *.bak_legado.
-
-Como rodar:
-    python migrar_legado.py
-
-Depois de migrar, rode de novo o gerar_playlist_final.py (item 2) e o
-servir_playlist.py (item 3) pra atualizar a lista final com os dados
-corrigidos.
-
---------------------------------------------------------------------------------
- 5) FERRAMENTAS DE APOIO / DEBUG (uso ocasional, nao faz parte do fluxo normal)
---------------------------------------------------------------------------------
-
-analisar_ui.py
-    O que faz: le a tela atual do emulador (via ADB) e lista todos os
-    elementos clicaveis (texto, id, posicao na tela). Serve pra investigar
-    a estrutura da interface do app quando o robo nao esta achando um botao.
-    Como rodar:
-        python analisar_ui.py
-    Pre-requisito: emulador aberto e conectado via ADB.
-
-testar_logcat.py
-    O que faz: mostra em tempo real as linhas do logcat do Android que
-    parecem ter URL de video/stream. Util pra investigar/depurar de onde
-    vem o link quando o metodo normal (memory dump) nao encontra nada.
-    Como rodar:
-        python testar_logcat.py
-    Depois de rodar, abra um video no emulador e acompanhe o terminal.
-    Pre-requisito: emulador aberto e conectado via ADB.
-    Pra parar: Ctrl+C.
-
-ler_indexeddb.py
-    O que faz: procura links de video dentro de um arquivo de banco
-    IndexedDB salvo pelo HTTP Toolkit (ferramenta externa de captura de
-    trafego), caso voce tenha usado o HTTP Toolkit pra investigar o app.
-    Como rodar:
-        python ler_indexeddb.py
-    Pre-requisito: o arquivo IndexedDB do HTTP Toolkit precisa existir no
-    caminho indicado dentro do proprio script (ajuste o caminho se mudar
-    de maquina/usuario).
-
---------------------------------------------------------------------------------
- 6) METODOS ANTIGOS DE CAPTURA (substituidos pelo robo_extrator.py atual,
-    mantidos so por referencia/backup - normalmente NAO precisa usar)
---------------------------------------------------------------------------------
-
-capturador.py
-    O que fazia: capturava os links "farejando" o trafego de rede do
-    emulador via tcpdump, rodado como root dentro do Android (comando
-    "adb shell su -c tcpdump ..."). Precisa que o emulador tenha root
-    liberado (su). Foi substituido pelo metodo de "memory dump" do
-    robo_extrator.py, que e mais confiavel e nao precisa de root.
-    Como rodar (se precisar usar por algum motivo):
-        python capturador.py
-    Pre-requisito: emulador com acesso root (su) habilitado.
-
-_mitm_addon.py
-    O que faz: addon do mitmproxy que intercepta o trafego HTTP/HTTPS do
-    emulador (configurado como proxy) e grava as URLs de midia encontradas
-    num arquivo fifo (Log/_urls_capturadas.fifo). Tambem foi substituido
-    pelo memory dump do robo atual. So seria necessario se decidir voltar
-    a capturar via proxy.
-    Como rodar (se precisar):
-        mitmdump -s _mitm_addon.py
-    Pre-requisito: mitmproxy instalado (ja esta no venv), emulador
-    configurado pra usar este PC como proxy HTTP/HTTPS, e o certificado
-    do mitmproxy instalado no Android (senao HTTPS nao decripta).
-
-================================================================================
- FLUXO RECOMENDADO NO DIA A DIA
-================================================================================
-    1. Abrir o LDPlayer e o app Every Cine.
-    2. python robo_extrator.py            -> captura tudo automaticamente.
-    3. python gerar_playlist_final.py     -> monta a lista unica final.
-    4. python servir_playlist.py          -> pega o link e usa no app de IPTV.
-================================================================================
+---
+*DICA DE FALLBACK (Desktops Virtuais)*
+Se um dia uma atualização do LDPlayer passar a pausar o áudio quando minimizado, 
+basta apertar `Win + Tab`, arrastar a janela do LDPlayer para o "Desktop 2", e 
+voltar a usar seu PC normalmente no "Desktop 1". O Windows achará que ele está 
+maximizado e não suspenderá a renderização!
