@@ -678,6 +678,41 @@ def _recortar(img, bounds_str):
     except Exception:
         return None
 
+def _preprocessar_para_ocr(img):
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        return [("V0_Original", img)]
+        
+    variantes = [("V0_Original", img)]
+    try:
+        gray = img.convert('L')
+        try:
+            v1 = ImageOps.autocontrast(gray)
+            variantes.append(("V1_AutoContraste", v1))
+        except Exception: pass
+        
+        try:
+            resample = getattr(Image, "Resampling", Image).LANCZOS
+            w, h = gray.size
+            v2 = gray.resize((int(w*2.5), int(h*2.5)), resample)
+            variantes.append(("V2_Upscale", v2))
+            
+            try:
+                v4 = v2.point(lambda p: 255 if p > 128 else 0)
+                variantes.append(("V4_Upscale_Limiar", v4))
+            except Exception: pass
+        except Exception: pass
+        
+        try:
+            v3 = gray.point(lambda p: 255 if p > 128 else 0)
+            variantes.append(("V3_Limiar", v3))
+        except Exception: pass
+        
+    except Exception: pass
+    
+    return variantes
+
 def ler_nome_por_ocr(bounds_str, img_tela=None):
     """Fallback: le o nome via OCR na imagem quando a acessibilidade nao retorna texto."""
     if not OCR_DISPONIVEL or not bounds_str:
@@ -685,13 +720,66 @@ def ler_nome_por_ocr(bounds_str, img_tela=None):
     img = capturar_screenshot_recorte(bounds_str, img_tela)
     if img is None:
         return ""
+        
+    global OCR_METRICAS
+    OCR_METRICAS["tentativas"] += 1
+    
+    melhor_texto = ""
+    melhor_conf = -1.0
+    melhor_var = ""
+    
+    variantes = _preprocessar_para_ocr(img)
+    configs_psm = [7, 6, 11]
+    whitelist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789áéíóúâêôãõçÁÉÍÓÚÂÊÔÃÕÇ.:-&'() "
+    
     try:
-        texto = pytesseract.image_to_string(img, lang="por+eng").strip()
-        texto = re.sub(r'\s+', ' ', texto)
-        return texto[:80]
+        from pytesseract import Output
+        for nome_var, img_var in variantes:
+            for psm in configs_psm:
+                custom_config = f'--psm {psm} -c tessedit_char_whitelist="{whitelist}"'
+                try:
+                    dados = pytesseract.image_to_data(img_var, lang="por+eng", config=custom_config, output_type=Output.DICT)
+                    palavras = []
+                    soma_conf = 0
+                    qtd = 0
+                    for i in range(len(dados['text'])):
+                        word = dados['text'][i].strip()
+                        conf = int(dados['conf'][i])
+                        if word and conf > 0:
+                            palavras.append(word)
+                            soma_conf += conf
+                            qtd += 1
+                    if qtd > 0:
+                        conf_media = soma_conf / float(qtd)
+                        texto_bruto = " ".join(palavras)
+                        texto_limpo = limpar_nome_sem_qualidade(texto_bruto)
+                        if texto_limpo and conf_media > melhor_conf:
+                            melhor_conf = conf_media
+                            melhor_texto = texto_limpo
+                            melhor_var = f"{nome_var} (PSM {psm})"
+                            if conf_media >= 85: break
+                except Exception: pass
+            if melhor_conf >= 85: break
     except Exception as e:
-        log(f"  [OCR] Falha ao ler imagem: {e}", "WARN")
+        log(f"  [OCR] Falha no pipeline: {e}", "WARN")
+        
+    if melhor_conf < 40 and not melhor_texto:
+        try:
+            texto = pytesseract.image_to_string(img, lang="por+eng").strip()
+            texto = re.sub(r'\s+', ' ', texto)
+            texto_limpo = limpar_nome_sem_qualidade(texto)[:80]
+            if texto_limpo:
+                OCR_METRICAS["sucessos"] += 1
+                return texto_limpo
+        except Exception: pass
         return ""
+        
+    if melhor_texto:
+        log(f"  [OCR] Cascata escolheu {melhor_var} - Conf: {melhor_conf:.1f}% - '{melhor_texto}'", "DEBUG")
+        OCR_METRICAS["sucessos"] += 1
+        return melhor_texto[:80]
+        
+    return ""
 
 def _phash_imagem(img, tamanho=8):
     """Hash perceptual simples (aHash): reduz o recorte a tamanho x tamanho em escala de
