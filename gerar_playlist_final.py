@@ -9,10 +9,13 @@ Uso:
 import os
 import re
 import json
+import argparse
+from collections import defaultdict
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR       = os.path.join(BASE_DIR, "log")
 CATALOGO_PATH = os.path.join(LOG_DIR, "catalogo.jsonl")
+MORTOS_PATH   = os.path.join(LOG_DIR, "links_mortos.jsonl")
 SAIDA_PATH    = os.path.join(LOG_DIR, "playlist_completa.m3u")
 
 ORDEM_CATEGORIAS = ["Canais_AoVivo", "Series", "Filmes", "Infantil", "Outros"]
@@ -39,7 +42,9 @@ def carregar_catalogo():
                 reg = json.loads(linha)
             except ValueError:
                 continue
-            itens[chave_url(reg["url"])] = reg
+            # garante fallback da key se reg["url_key"] não existir
+            ukey = reg.get("url_key") or chave_url(reg["url"])
+            itens[ukey] = reg
     return itens
 
 
@@ -74,6 +79,25 @@ def carregar_m3u_legado(categoria, ja_vistos):
     return itens
 
 
+def carregar_mortos():
+    """Lê o sidecar de revalidação e retorna um set de chaves (url_key) marcadas como 'morto'."""
+    mortos = set()
+    if not os.path.exists(MORTOS_PATH):
+        return mortos
+    with open(MORTOS_PATH, encoding="utf-8", errors="replace") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                reg = json.loads(linha)
+                if reg.get("status") == "morto":
+                    mortos.add(reg["url_key"])
+            except (ValueError, KeyError):
+                continue
+    return mortos
+
+
 def chave_ordenacao(item):
     cat_idx = ORDEM_CATEGORIAS.index(item["categoria"]) if item["categoria"] in ORDEM_CATEGORIAS else len(ORDEM_CATEGORIAS)
     grupo = item.get("grupo") or ""
@@ -88,12 +112,33 @@ def chave_ordenacao(item):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Gera playlist consolidada.")
+    parser.add_argument("--incluir-mortos", action="store_true", help="Não exclui links marcados como 'morto' pelo revalidador.")
+    args = parser.parse_args()
+
     catalogo = carregar_catalogo()
     ja_vistos = set(catalogo.keys())
 
-    todos = list(catalogo.values())
+    mortos = set() if args.incluir_mortos else carregar_mortos()
+    
+    todos = []
+    excluidos_por_cat = defaultdict(int)
+
+    # Processa itens do catalogo.jsonl
+    for url_key, item in catalogo.items():
+        if url_key in mortos:
+            excluidos_por_cat[item.get("categoria", "Outros")] += 1
+            continue
+        todos.append(item)
+
+    # Processa fallback pros arquivos de legado
     for categoria in ORDEM_CATEGORIAS:
-        todos.extend(carregar_m3u_legado(categoria, ja_vistos))
+        for item in carregar_m3u_legado(categoria, ja_vistos):
+            chave = chave_url(item["url"])
+            if chave in mortos:
+                excluidos_por_cat[item.get("categoria", "Outros")] += 1
+                continue
+            todos.append(item)
 
     todos.sort(key=chave_ordenacao)
 
@@ -105,7 +150,12 @@ def main():
             f.write(f'#EXTINF:-1 group-title="{grupo}",{nome}\n{item["url"]}\n')
 
     print(f"Playlist final gerada: {SAIDA_PATH}")
-    print(f"Total de itens: {len(todos)}")
+    print(f"Total de itens válidos: {len(todos)}")
+    
+    if excluidos_por_cat:
+        print("\nItens MORTOS excluídos da playlist (graças ao revalidador):")
+        for cat, qtd in excluidos_por_cat.items():
+            print(f"  {cat}: {qtd} itens")
 
 
 if __name__ == "__main__":
