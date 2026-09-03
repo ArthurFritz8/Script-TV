@@ -1,0 +1,14 @@
+# Ambiente virtual / cache Python
+.venv/
+__pycache__/
+*.pyc
+
+# Dados capturados (playlists, catalogo, logs de sessao) -- nao versionar:
+# contem links de streaming reais (potencialmente protegidos por direitos autorais)
+# e sao gerados localmente a cada execucao do robo, nao fazem parte do codigo-fonte.
+Log/
+
+# Artefatos de depuracao (dumps de UI do emulador, screenshots)
+ui_*.xml
+tela_atual.png
+nul
