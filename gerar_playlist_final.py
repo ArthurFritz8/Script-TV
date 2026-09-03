@@ -10,6 +10,8 @@ import os
 import re
 import json
 import argparse
+import tmdb_cache
+from servir_playlist import descobrir_ip_local
 from collections import defaultdict
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -165,6 +167,7 @@ def main():
     parser = argparse.ArgumentParser(description="Gera playlist consolidada.")
     parser.add_argument("--incluir-mortos", action="store_true", help="Não exclui links marcados como 'morto' pelo revalidador.")
     args = parser.parse_args()
+    base_url_img = args.base_url.rstrip("/") if args.base_url else f"http://{descobrir_ip_local()}:8765"
 
     catalogo = carregar_catalogo()
     ja_vistos = set(catalogo.keys())
@@ -236,7 +239,17 @@ def main():
         for item in todos_dedup:
             grupo = item.get("grupo") or item.get("categoria") or "Outros"
             nome  = item.get("nome") or "Desconhecido"
-            f.write(f'#EXTINF:-1 group-title="{grupo}",{nome}\n{item["url"]}\n')
+            categoria = item.get("categoria", "")
+            
+            extinf = f'#EXTINF:-1 group-title="{grupo}"'
+            
+            if categoria in ["Filmes", "Series", "Infantil"]:
+                caminho_img = tmdb_cache.obter_poster_local(item.get("nome_base") or nome, categoria)
+                if caminho_img:
+                    extinf += f' tvg-logo="{base_url_img}/{caminho_img}"'
+            
+            extinf += f',{nome}\n{item["url"]}\n'
+            f.write(extinf)
 
     # 7. Relatórios
     print(f"Playlist final gerada: {SAIDA_PATH}")
