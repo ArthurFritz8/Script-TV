@@ -1,232 +1,205 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Revalidador de Links (Camada de Qualidade Não-Destrutiva)
-Verifica os links do catalogo.jsonl via HTTP e grava status em links_mortos.jsonl.
-NUNCA deleta entradas do catalogo original.
-"""
-
-import sys, os, json, time, argparse, tempfile
-from datetime import datetime, timedelta
+import os
+import sys
+import json
+import time
+import argparse
 import urllib.request
+import urllib.error
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR       = os.path.join(BASE_DIR, "log")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "log")
 CATALOGO_PATH = os.path.join(LOG_DIR, "catalogo.jsonl")
-MORTOS_PATH   = os.path.join(LOG_DIR, "links_mortos.jsonl")
+MORTOS_PATH = os.path.join(LOG_DIR, "links_mortos.jsonl")
+MORTOS_TMP_PATH = os.path.join(LOG_DIR, "links_mortos.tmp.jsonl")
 
-TTL_HORAS = 24
-TIMEOUT = 5
+TTL_SEGUNDOS = 24 * 3600  # 24 horas
 
-CORES = {
-    "INFO": "", "OK": "\033[92m", "WARN": "\033[93m",
-    "ERR": "\033[91m", "NET": "\033[96m"
-}
-
-def log(msg, nivel="INFO"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    cor = CORES.get(nivel, "")
-    reset = "\033[0m" if cor else ""
-    print(f"{cor}[{ts}] [{nivel}] {msg}{reset}")
-
-def carregar_catalogo(incluir_ao_vivo):
-    """Lê todas as URLs do catalogo.jsonl, retornando dicionário por url_key."""
-    itens = {}
+def carregar_catalogo():
     if not os.path.exists(CATALOGO_PATH):
-        log("Catalogo não encontrado.", "ERR")
-        return itens
-    
-    with open(CATALOGO_PATH, encoding="utf-8", errors="replace") as f:
+        return []
+    itens = []
+    with open(CATALOGO_PATH, "r", encoding="utf-8", errors="replace") as f:
         for linha in f:
-            linha = linha.strip()
-            if not linha:
+            if not linha.strip():
                 continue
             try:
-                reg = json.loads(linha)
-                url_key = reg["url_key"]
-                cat = reg.get("categoria", "")
-                if cat == "Canais_AoVivo" and not incluir_ao_vivo:
-                    continue
-                itens[url_key] = reg
-            except (ValueError, KeyError):
-                continue
+                itens.append(json.loads(linha))
+            except Exception:
+                pass
     return itens
 
-def carregar_mortos():
-    """Lê o estado atual do sidecar links_mortos.jsonl."""
-    mortos = {}
+def carregar_sidecar():
+    db = {}
     if not os.path.exists(MORTOS_PATH):
-        return mortos
-    with open(MORTOS_PATH, encoding="utf-8", errors="replace") as f:
+        return db
+    with open(MORTOS_PATH, "r", encoding="utf-8", errors="replace") as f:
         for linha in f:
-            linha = linha.strip()
-            if not linha:
+            if not linha.strip():
                 continue
             try:
                 reg = json.loads(linha)
-                mortos[reg["url_key"]] = reg
-            except (ValueError, KeyError):
-                continue
-    return mortos
-
-def salvar_mortos_atomico(mortos_dict):
-    """Grava de forma segura (tmp + rename) para evitar corrupção no Ctrl+C."""
-    os.makedirs(LOG_DIR, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=LOG_DIR, text=True)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        for key, reg in mortos_dict.items():
-            f.write(json.dumps(reg, ensure_ascii=False) + "\n")
-    os.replace(tmp_path, MORTOS_PATH)
-
-def testar_url(url, usar_fallback_ua=False):
-    """Testa URL com requisição parcial. Captura status 403/401."""
-    if usar_fallback_ua:
-        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    else:
-        ua = 'ExoPlayerDemo/2.11.8 (Linux;Android 9) ExoPlayerLib/2.11.8'
-        
-    req = urllib.request.Request(url, headers={
-        'User-Agent': ua,
-        'Range': 'bytes=0-100'
-    })
-    
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as res:
-            ct = res.info().get('Content-Type','')
-            return True, ct, 200
-    except HTTPError as e:
-        if e.code == 206:
-            return True, e.headers.get('Content-Type',''), 206
-        return False, str(e.code), e.code
-    except Exception as e:
-        return False, str(e), 0
-
-def processar_item(url_key, registro_catalogo, estado_anterior):
-    url = registro_catalogo["url"]
-    agora = datetime.now()
-    agora_str = agora.strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 1. Checagem de TTL
-    status_ant = "vivo"
-    falhas_ant = 0
-    if estado_anterior:
-        status_ant = estado_anterior.get("status", "vivo")
-        falhas_ant = estado_anterior.get("falhas", 0)
-        ult_cheq_str = estado_anterior.get("ultima_checagem")
-        if ult_cheq_str:
-            try:
-                ult_cheq = datetime.strptime(ult_cheq_str, "%Y-%m-%d %H:%M:%S")
-                if agora - ult_cheq < timedelta(hours=TTL_HORAS):
-                    return "skip", estado_anterior
-            except ValueError:
+                if "url_key" in reg:
+                    db[reg["url_key"]] = reg
+            except Exception:
                 pass
-                
-    # 2. Testa HTTP
-    ok, erro_msg, code = testar_url(url)
+    return db
+
+def salvar_sidecar_atomico(db):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(MORTOS_TMP_PATH, "w", encoding="utf-8") as f:
+        for v in db.values():
+            f.write(json.dumps(v, ensure_ascii=False) + "\n")
+    os.replace(MORTOS_TMP_PATH, MORTOS_PATH)
+
+def checar_url(url):
+    """
+    Retorna uma tupla (codigo, erro_msg)
+    codigo = 200/206 (sucesso), 403/401 (geo/ua), 429/0 (timeout/net), 404 (erro final).
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.162 Mobile Safari/537.36",
+        "Range": "bytes=0-100"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status in [200, 206]:
+                return (200, "OK")
+            return (resp.status, "OK")
+    except HTTPError as e:
+        return (e.code, str(e))
+    except (URLError, TimeoutError, OSError) as e:
+        return (0, str(e)) # Erro de rede ou timeout (instabilidade)
+    except Exception as e:
+        return (0, str(e))
+
+def processar_item(item, db_entry_existente):
+    url = item.get("url")
+    url_key = item.get("url_key")
+    cat = item.get("categoria", "Outros")
     
-    # Tentativa de fallback para 403/401
-    if not ok and code in (401, 403):
-        ok, erro_msg, code = testar_url(url, usar_fallback_ua=True)
-        if ok:
-            log(f"[FALLBACK OK] {url[:60]}...", "OK")
+    agora = time.time()
     
-    # 3. Define novo status
-    novo_estado = {
+    # Reusa DB se existir
+    estado = db_entry_existente or {
         "url_key": url_key,
-        "ultima_checagem": agora_str,
-        "categoria": registro_catalogo.get("categoria", "Outros")
+        "categoria": cat,
+        "status": "vivo",
+        "strikes": 0,
+        "ultima_checagem": 0
     }
     
-    if ok:
-        novo_estado["status"] = "vivo"
-        novo_estado["falhas"] = 0
-        return "vivo", novo_estado
+    # Verifica TTL
+    if (agora - estado.get("ultima_checagem", 0)) < TTL_SEGUNDOS:
+        # Pula checagem, retorna o estado cacheado
+        return (url_key, estado, False) # False = nao checou
         
-    if code in (401, 403):
-        # Bloqueio provavel de User-Agent/Geo. Nunca vira "morto".
-        novo_estado["status"] = "suspeito"
-        novo_estado["falhas"] = falhas_ant  # Mantém contagem
-        return "suspeito", novo_estado
-        
-    # Timeout / 404 / outros erros -> incrementa falha
-    novas_falhas = falhas_ant + 1
-    novo_estado["falhas"] = novas_falhas
-    if novas_falhas >= 2:
-        novo_estado["status"] = "morto"
-        return "morto", novo_estado
+    codigo, msg = checar_url(url)
+    estado["ultima_checagem"] = agora
+    estado["categoria"] = cat
+    
+    if codigo in [200, 206]:
+        estado["status"] = "vivo"
+        estado["strikes"] = 0
+    elif codigo in [401, 403]:
+        estado["status"] = "suspeito"
+        # Nao incrementa strikes para nao matar por bloqueio regional
+    elif codigo == 0 or codigo == 429:
+        estado["status"] = "suspeito"
+        # Nao incrementa strikes para nao matar por timeout de internet do PC
     else:
-        novo_estado["status"] = "suspeito"
-        return "suspeito", novo_estado
+        # Outros erros HTTP (404, 500, etc)
+        estado["strikes"] += 1
+        if estado["strikes"] >= 2:
+            estado["status"] = "morto"
+        else:
+            estado["status"] = "suspeito"
+            
+    return (url_key, estado, True) # True = checou
 
 def main():
-    parser = argparse.ArgumentParser(description="Revalidador de Links do Catálogo (Sidecar)")
-    parser.add_argument("--incluir-ao-vivo", action="store_true", help="Inclui canais ao vivo (costumam dar falso negativo alto)")
-    parser.add_argument("--threads", type=int, default=12, help="Número de threads (default: 12)")
+    parser = argparse.ArgumentParser(description="Revalida links M3U8 do catalogo.")
+    parser.add_argument("--incluir-ao-vivo", action="store_true", help="Revalidar Canais_AoVivo tambem (padrao: pular)")
     args = parser.parse_args()
 
-    catalogo = carregar_catalogo(args.incluir_ao_vivo)
+    print("Carregando catalogo e base de mortos...")
+    catalogo = carregar_catalogo()
     if not catalogo:
+        print("Catalogo vazio ou inexistente.")
         return
         
-    estado_atual = carregar_mortos()
+    sidecar_db = carregar_sidecar()
     
-    log(f"Iniciando revalidação de {len(catalogo)} links (Threads: {args.threads})", "INFO")
+    itens_para_checar = []
+    estatisticas = defaultdict(lambda: {"total": 0, "vivos": 0, "suspeitos": 0, "mortos": 0, "ignorados": 0})
     
-    estatisticas = defaultdict(lambda: {"vivo": 0, "suspeito": 0, "morto": 0, "skip": 0})
-    novo_estado_global = dict(estado_atual) # Copia o estado atual
-    
-    processados = 0
-    total_catalogo = len(catalogo)
-    
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = {executor.submit(processar_item, k, v, estado_atual.get(k)): (k, v) for k, v in catalogo.items()}
+    for item in catalogo:
+        cat = item.get("categoria", "Outros")
         
-        for future in as_completed(futures):
-            k, reg = futures[future]
-            processados += 1
-            if processados % 50 == 0:
-                log(f"Progresso: {processados}/{total_catalogo}", "INFO")
-                
-            try:
-                acao, estado_item = future.result()
-                cat = estado_item.get("categoria", reg.get("categoria", "Outros"))
-                estatisticas[cat][acao] += 1
-                
-                # Atualiza com o novo estado (vivo, morto ou suspeito)
-                novo_estado_global[k] = estado_item
-                
-            except Exception as e:
-                log(f"Erro inesperado no link {k[:30]}: {e}", "ERR")
-                
-    # Limpa do sidecar links que não existem mais no catálogo
-    keys_no_catalogo = set(catalogo.keys())
-    novo_estado_global = {k: v for k, v in novo_estado_global.items() if k in keys_no_catalogo}
+        if cat == "Canais_AoVivo" and not args.incluir_ao_vivo:
+            estatisticas[cat]["total"] += 1
+            estatisticas[cat]["ignorados"] += 1
+            continue
+            
+        itens_para_checar.append(item)
+        estatisticas[cat]["total"] += 1
+        
+    print(f"Total de itens elegiveis para checagem: {len(itens_para_checar)}")
+    if not itens_para_checar:
+        return
+
+    # Execucao multi-thread
+    futuros = {}
+    novo_sidecar = {}
+    checados_agora = 0
     
-    salvar_mortos_atomico(novo_estado_global)
+    print("Iniciando validacao HTTP (isso pode demorar varios minutos)...")
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        for item in itens_para_checar:
+            uk = item.get("url_key")
+            f = executor.submit(processar_item, item, sidecar_db.get(uk))
+            futuros[f] = item
+            
+        for f in as_completed(futuros):
+            uk, estado, checou_realmente = f.result()
+            
+            # Se ainda estiver "vivo", nao precisamos manter no sidecar (pra economizar espaco)
+            # MAS se quisermos preservar a ultima_checagem, temos que salvar. Vamos salvar todos.
+            novo_sidecar[uk] = estado
+            
+            cat = estado["categoria"]
+            if estado["status"] == "vivo":
+                estatisticas[cat]["vivos"] += 1
+            elif estado["status"] == "suspeito":
+                estatisticas[cat]["suspeitos"] += 1
+            elif estado["status"] == "morto":
+                estatisticas[cat]["mortos"] += 1
+                
+            if checou_realmente:
+                checados_agora += 1
+                if checados_agora % 50 == 0:
+                    print(f"  ... progresso: {checados_agora} requests efetuados")
+
+    print("Salvando sidecar de forma atomica...")
+    salvar_sidecar_atomico(novo_sidecar)
     
-    # ---------------- RELATORIO ----------------
     print("\n" + "="*50)
-    print("RELATÓRIO DE REVALIDAÇÃO")
+    print(" RELATORIO DE REVALIDACAO ")
     print("="*50)
     
     for cat, stats in estatisticas.items():
-        total_cat = sum(stats.values())
-        print(f"\nCategoria: {cat} (Total Checado: {total_cat})")
-        print(f"  Vivos     : {stats['vivo']} (Nesta checagem)")
-        print(f"  Pulos(TTL): {stats['skip']} (Validados nas últimas 24h)")
-        print(f"  Suspeitos : {stats['suspeito']} (1 falha ou bloqueio HTTP)")
-        print(f"  Mortos    : {stats['morto']} (2 falhas - excluídos da playlist)")
+        print(f"[{cat}] Total: {stats['total']} | Vivos: {stats['vivos']} | Suspeitos: {stats['suspeitos']} | Mortos: {stats['mortos']} | Ignorados: {stats['ignorados']}")
         
-        mortos = stats['morto']
-        if total_cat > 0:
-            taxa = mortos / total_cat
-            if taxa > 0.3:
-                log(f"  [ALERTA] >30% de links mortos ({taxa:.1%})! O app provavelmente mudou a CDN. Re-extraia o catálogo!", "WARN")
+        checa_valido = stats['total'] - stats['ignorados']
+        if checa_valido > 10 and stats['mortos'] > (checa_valido * 0.3):
+            print(f"  -> [ALERTA] Mais de 30% dos links de {cat} confirmados como MORTOS!")
+            print(f"  -> [ALERTA] Forte indicio de que o APP trocou de servidor/CDN.")
+            print(f"  -> [ALERTA] RECOMENDACAO: Re-extrair este catalogo pelo emulador.")
 
-    print("\nConcluído. Sidecar salvo em:", MORTOS_PATH)
+    print("\nExecucao finalizada com sucesso.")
 
 if __name__ == "__main__":
     main()
