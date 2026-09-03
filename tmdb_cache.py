@@ -52,13 +52,10 @@ def obter_poster_local(nome_base, categoria):
     if not api_key:
         return None
 
-    # Normalizar nome basico
-    nome_limpo = nome_base.strip()
-    if not nome_limpo:
+    # Gerar hash unico
+    hash_key = gerar_hash_chave(nome_base, categoria)
+    if not hash_key:
         return None
-
-    # Gerar hash unico para o titulo+categoria
-    hash_key = hashlib.md5(f"{nome_limpo}_{categoria}".lower().encode()).hexdigest()
     
     _carregar_cache()
     
@@ -127,3 +124,29 @@ def obter_poster_local(nome_base, categoria):
     except Exception:
         # Qualquer outro erro de rede, apenas silenciar e voltar sem capa
         return None
+
+def gerar_hash_chave(nome_base, categoria):
+    nome_limpo = (nome_base or "").strip()
+    if not nome_limpo:
+        return None
+    return hashlib.md5(f"{nome_limpo}_{categoria}".lower().encode()).hexdigest()
+
+def resolver_poster_local(nome_base, categoria):
+    """
+    Funcao READ-ONLY. Resolve o poster apenas no disco/cache.
+    Retorna uma tupla (caminho_relativo, title_oficial) ou (None, None).
+    NUNCA toca na API.
+    """
+    hash_key = gerar_hash_chave(nome_base, categoria)
+    if not hash_key:
+        return None, None
+    
+    _carregar_cache()
+    caminho_absoluto = os.path.join(LOG_DIR, "capas", f"{hash_key}.jpg")
+    caminho_relativo = f"capas/{hash_key}.jpg"
+    
+    if hash_key in _CACHE_MEM:
+        info = _CACHE_MEM[hash_key]
+        if info.get("poster_path") and os.path.exists(caminho_absoluto):
+            return caminho_relativo, info.get("title")
+    return None, None
