@@ -1603,7 +1603,7 @@ def processar_aba_com_subabas(label, tap_x, tap_y):
     for swipe_n in range(5):
         xml  = get_ui_xml()
         root = parse_xml(xml)
-        if root:
+        if root is not None:
             for node in root.iter("node"):
                 if node.get("clickable") != "true":
                     continue
@@ -1801,13 +1801,13 @@ def _abrir_aba_por_texto(texto, texto_alt=None):
     tap(*MENU_INICIO, delay=2)
     root = parse_xml(get_ui_xml())
     n = encontrar_no(root, texto=texto)
-    if not n and texto_alt:
+    if n is None and texto_alt:
         n = encontrar_no(root, texto=texto_alt)
     return n
 
 def rodar_filmes():
     n = _abrir_aba_por_texto("Filmes")
-    if n:
+    if n is not None:
         cx, cy = bounds_centro(n.get("bounds",""))
         processar_aba_com_subabas("Filmes", cx, cy)
     else:
@@ -1815,7 +1815,7 @@ def rodar_filmes():
 
 def rodar_series():
     n = _abrir_aba_por_texto("Series", "ries")
-    if n:
+    if n is not None:
         cx, cy = bounds_centro(n.get("bounds",""))
         processar_aba_com_subabas("Series", cx, cy)
     else:
@@ -1823,7 +1823,7 @@ def rodar_series():
 
 def rodar_infantil():
     n = _abrir_aba_por_texto("Infantil")
-    if n:
+    if n is not None:
         cx, cy = bounds_centro(n.get("bounds",""))
         processar_aba("Infantil", cx, cy)
     else:
