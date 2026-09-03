@@ -42,6 +42,7 @@ try:
     OCR_DISPONIVEL = PIL_DISPONIVEL
 except ImportError:
     OCR_DISPONIVEL = False
+OCR_METRICAS = {"tentativas": 0, "sucessos": 0}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURACOES
@@ -1764,6 +1765,12 @@ def imprimir_relatorio(duracao):
                 log(f"    + {fname:<35} -> {count} itens", "OK")
             except OSError:
                 pass
+    if OCR_DISPONIVEL:
+        t, s = OCR_METRICAS["tentativas"], OCR_METRICAS["sucessos"]
+        tx = (s/t*100) if t > 0 else 0
+        log(f"  OCR Fallback: {s} sucessos em {t} tentativas ({tx:.1f}%)", "INFO")
+        log(f"{sep}", "OK")
+        
     if _erros_sessao:
         log(f"{'-'*62}", "WARN")
         log(f"  Erros nesta sessao: {len(_erros_sessao)}", "WARN")
