@@ -166,6 +166,7 @@ def gerar_log_conflitos(todos):
 def main():
     parser = argparse.ArgumentParser(description="Gera playlist consolidada.")
     parser.add_argument("--incluir-mortos", action="store_true", help="Não exclui links marcados como 'morto' pelo revalidador.")
+    parser.add_argument("--sincronizar", action="store_true", help="Sincroniza automaticamente a playlist para a nuvem via GitHub Gists.")
     args = parser.parse_args()
     base_url_img = args.base_url.rstrip("/") if args.base_url else f"http://{descobrir_ip_local()}:8765"
 
@@ -270,6 +271,11 @@ def main():
         print(f"\n[!] Encontrados {conflitos_qnt} títulos em categorias cruzadas com URLs distintas.")
         print(f"    Consulte: {CONFLITOS_LOG}")
 
+
+    if args.sincronizar:
+        import subprocess
+        print("\n[+] Sincronizando playlist com a nuvem (GitHub Gists)...")
+        subprocess.run(["python", "sincronizar_nuvem.py"], check=False)
 
 if __name__ == "__main__":
     main()
