@@ -17,19 +17,31 @@ LOG_DIR       = os.path.join(BASE_DIR, "log")
 CATALOGO_PATH = os.path.join(LOG_DIR, "catalogo.jsonl")
 MORTOS_PATH   = os.path.join(LOG_DIR, "links_mortos.jsonl")
 SAIDA_PATH    = os.path.join(LOG_DIR, "playlist_completa.m3u")
+CONFLITOS_LOG = os.path.join(LOG_DIR, "conflitos_categorias.log")
 
 ORDEM_CATEGORIAS = ["Canais_AoVivo", "Series", "Filmes", "Infantil", "Outros"]
 _RANK_QUALIDADE  = {None: 0, "SD": 1, "HD": 2, "FHD": 3, "4K": 4}
 
+# Prioridade especifica de deduplicação (quando a mesma URL aparece em categorias diferentes).
+# Mantemos o de menor valor numérico.
+PRIORIDADE_DEDUP = {"Filmes": 1, "Series": 2, "Infantil": 3, "Canais_AoVivo": 4, "Outros": 5}
+
 _RE_EXTINF = re.compile(r'^#EXTINF:-?\d+(?:\s+group-title="([^"]*)")?\s*,(.*)$')
+_RE_QUALIDADE_SUFIXO = re.compile(r'\s*\[(4K|FHD|HD|SD)\]$', re.I)
 
 
 def chave_url(url):
     return url.split("?", 1)[0].split("#", 1)[0].lower()
 
 
+def nome_normalizado_conflito(item):
+    """Retorna o título base (sem marcações de qualidade) para detecção de conflitos de catálogo."""
+    n = item.get("nome_base") or item.get("serie") or item.get("nome") or ""
+    return _RE_QUALIDADE_SUFIXO.sub('', n).strip().lower()
+
+
 def carregar_catalogo():
-    """Le Log/catalogo.jsonl (formato novo, ja tem grupo/tipo/temporada/episodio)."""
+    """Le Log/catalogo.jsonl."""
     itens = {}
     if not os.path.exists(CATALOGO_PATH):
         return itens
@@ -42,8 +54,8 @@ def carregar_catalogo():
                 reg = json.loads(linha)
             except ValueError:
                 continue
-            # garante fallback da key se reg["url_key"] não existir
             ukey = reg.get("url_key") or chave_url(reg["url"])
+            reg["url_key"] = ukey
             itens[ukey] = reg
     return itens
 
@@ -71,7 +83,7 @@ def carregar_m3u_legado(categoria, ja_vistos):
             if chave in ja_vistos:
                 continue
             itens.append({
-                "url": linha, "categoria": categoria,
+                "url": linha, "url_key": chave, "categoria": categoria,
                 "grupo": grupo_atual or categoria,
                 "nome": nome_atual or "Desconhecido",
             })
@@ -111,6 +123,44 @@ def chave_ordenacao(item):
     return (cat_idx, grupo, 1, 0, 0, titulo_base, rank_q)
 
 
+def gerar_log_conflitos(todos):
+    """
+    Rastreia se o mesmo titulo (limpo) tem URLs diferentes espalhadas em categorias diferentes.
+    Não altera os dados, apenas grava o log de alerta.
+    """
+    agrupado = defaultdict(list)
+    for idx, item in enumerate(todos):
+        nome_norm = nome_normalizado_conflito(item)
+        if not nome_norm:
+            continue
+        agrupado[nome_norm].append(item)
+        
+    com_conflito = 0
+    linhas_log = []
+    
+    for nome_norm, itens in agrupado.items():
+        if len(itens) < 2:
+            continue
+            
+        categorias_vistas = set(i.get("categoria", "Outros") for i in itens)
+        url_keys_vistas = set(i.get("url_key", "") for i in itens)
+        
+        # Tem que aparecer em categorias diferentes E com URLs diferentes para ser um "conflito".
+        # Se for na mesma categoria, ou se a URL for a mesma, é tratado por outras regras (qualidade ou dedup).
+        if len(categorias_vistas) > 1 and len(url_keys_vistas) > 1:
+            com_conflito += 1
+            linhas_log.append(f"CONFLITO: {itens[0].get('nome_base') or itens[0].get('nome')}")
+            for i in itens:
+                linhas_log.append(f"  [{i.get('categoria', 'Outros')}] {i.get('url')}")
+            linhas_log.append("")
+            
+    if com_conflito > 0:
+        with open(CONFLITOS_LOG, "w", encoding="utf-8") as f:
+            f.write("\n".join(linhas_log))
+        return com_conflito
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gera playlist consolidada.")
     parser.add_argument("--incluir-mortos", action="store_true", help="Não exclui links marcados como 'morto' pelo revalidador.")
@@ -118,44 +168,94 @@ def main():
 
     catalogo = carregar_catalogo()
     ja_vistos = set(catalogo.keys())
-
     mortos = set() if args.incluir_mortos else carregar_mortos()
     
     todos = []
-    excluidos_por_cat = defaultdict(int)
+    excluidos_mortos_por_cat = defaultdict(int)
 
-    # Processa itens do catalogo.jsonl
+    # 1. Carregar base principal
     for url_key, item in catalogo.items():
         if url_key in mortos:
-            excluidos_por_cat[item.get("categoria", "Outros")] += 1
+            excluidos_mortos_por_cat[item.get("categoria", "Outros")] += 1
             continue
         todos.append(item)
 
-    # Processa fallback pros arquivos de legado
+    # 2. Carregar legado
     for categoria in ORDEM_CATEGORIAS:
         for item in carregar_m3u_legado(categoria, ja_vistos):
-            chave = chave_url(item["url"])
-            if chave in mortos:
-                excluidos_por_cat[item.get("categoria", "Outros")] += 1
+            if item["url_key"] in mortos:
+                excluidos_mortos_por_cat[item.get("categoria", "Outros")] += 1
                 continue
             todos.append(item)
 
-    todos.sort(key=chave_ordenacao)
+    # 3. Registrar conflitos cruzados de catálogo ANTES do deduplicador
+    conflitos_qnt = gerar_log_conflitos(todos)
 
+    # 4. Deduplicação Transversal (mesma URL em múltiplas categorias)
+    agrupado_por_url = defaultdict(list)
+    for item in todos:
+        agrupado_por_url[item.get("url_key")].append(item)
+        
+    todos_dedup = []
+    dedup_removidos = defaultdict(lambda: defaultdict(int))
+    
+    for ukey, itens in agrupado_por_url.items():
+        # Canais ao vivo não são deduplicados (variantes legítimas podem compartilhar a mesma url base/tokenless)
+        if any(i.get("categoria") == "Canais_AoVivo" for i in itens):
+            todos_dedup.extend(itens)
+            continue
+            
+        if len(itens) == 1:
+            todos_dedup.append(itens[0])
+            continue
+            
+        # Ordena a lista de duplicatas para manter a de melhor ranking.
+        # Regra 1: Prioridade da Categoria (Filmes > Series > Infantil > Outros)
+        # Regra 2: Melhor qualidade (Rank Qualidade Negativo, pois sorteia crescente)
+        itens.sort(key=lambda x: (
+            PRIORIDADE_DEDUP.get(x.get("categoria"), 99),
+            -_RANK_QUALIDADE.get(x.get("qualidade"), 0)
+        ))
+        
+        # Mantém o vencedor
+        vencedor = itens[0]
+        todos_dedup.append(vencedor)
+        
+        # Loga os perdedores
+        cat_vencedora = vencedor.get("categoria", "Outros")
+        for perdedor in itens[1:]:
+            cat_perdedora = perdedor.get("categoria", "Outros")
+            dedup_removidos[cat_vencedora][cat_perdedora] += 1
+
+    # 5. Ordenação final para exibição
+    todos_dedup.sort(key=chave_ordenacao)
+
+    # 6. Gravar playlist
     with open(SAIDA_PATH, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
-        for item in todos:
+        for item in todos_dedup:
             grupo = item.get("grupo") or item.get("categoria") or "Outros"
             nome  = item.get("nome") or "Desconhecido"
             f.write(f'#EXTINF:-1 group-title="{grupo}",{nome}\n{item["url"]}\n')
 
+    # 7. Relatórios
     print(f"Playlist final gerada: {SAIDA_PATH}")
-    print(f"Total de itens válidos: {len(todos)}")
+    print(f"Total de itens válidos: {len(todos_dedup)}")
     
-    if excluidos_por_cat:
-        print("\nItens MORTOS excluídos da playlist (graças ao revalidador):")
-        for cat, qtd in excluidos_por_cat.items():
+    if excluidos_mortos_por_cat:
+        print("\n[+] Itens MORTOS excluídos (via revalidador):")
+        for cat, qtd in excluidos_mortos_por_cat.items():
             print(f"  {cat}: {qtd} itens")
+            
+    if dedup_removidos:
+        print("\n[+] Duplicatas de URL EXATA removidas:")
+        for cat_win, perdedoras in dedup_removidos.items():
+            for cat_lose, qtd in perdedoras.items():
+                print(f"  {qtd} itens (Mantido: {cat_win} / Descartado: {cat_lose})")
+                
+    if conflitos_qnt > 0:
+        print(f"\n[!] Encontrados {conflitos_qnt} títulos em categorias cruzadas com URLs distintas.")
+        print(f"    Consulte: {CONFLITOS_LOG}")
 
 
 if __name__ == "__main__":
