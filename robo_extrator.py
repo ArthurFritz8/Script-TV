@@ -23,14 +23,23 @@ from collections import defaultdict
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
+# PIL (opcional): usado pelo OCR E pelo fingerprint visual (pHash) de cards sem nome.
+# Separado do import do pytesseract de proposito -- o pHash so precisa do Pillow (leve,
+# instalado via pip), enquanto o OCR precisa TAMBEM do binario externo do Tesseract; sem
+# essa separacao, faltar so o Tesseract derrubava os dois recursos a toa.
+try:
+    from PIL import Image
+    PIL_DISPONIVEL = True
+except ImportError:
+    PIL_DISPONIVEL = False
+
 # OCR (opcional): fallback de leitura de nome quando a acessibilidade nao retorna texto
 try:
     import pytesseract
-    from PIL import Image
     _TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(_TESSERACT_EXE):
         pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE
-    OCR_DISPONIVEL = True
+    OCR_DISPONIVEL = PIL_DISPONIVEL
 except ImportError:
     OCR_DISPONIVEL = False
 
@@ -66,15 +75,29 @@ os.makedirs(LOG_DIR, exist_ok=True)
 urls_salvas           = set()
 urls_canonicas_salvas = set()
 nomes_salvos          = set()
+nomes_base_salvos     = set()              # nome BASE (sem qualidade) normalizado -- so p/ pular clique (nunca bloqueia salvar())
 qualidades_salvas     = defaultdict(set)   # chave_versao -> {"SD", "HD", ...} ja salvas p/ esse titulo/episodio
 lock                  = threading.Lock()
 stats                 = defaultdict(int)
 _aba_atual            = [""]
 _erros_sessao         = []
 _tmdb_cache           = {}
-_visitados_global     = set()
+_visitados_status     = {}                 # chave (tuple) -> "em_processo" | "concluido"
+_phash_registro       = defaultdict(list)  # label -> [hash, hash, ...] ja conhecidos (fingerprint de cards sem nome)
 ESTADO_PATH           = os.path.join(LOG_DIR, "estado_visitados.jsonl")
 CATALOGO_PATH         = os.path.join(LOG_DIR, "catalogo.jsonl")
+CHECKPOINT_PATH       = os.path.join(LOG_DIR, "estado_posicao.json")
+
+_LIMIAR_PHASH     = 5      # distancia de Hamming maxima p/ considerar 2 recortes "o mesmo card"
+_CRASH_JANELA_SEG = 600    # janela deslizante p/ contar crashes (10 min)
+_CRASH_LIMITE     = 3      # acima disso na janela -> desiste da aba em vez de insistir
+_crash_timestamps = []
+_checkpoint_atual = {"aba": None, "sub_aba": None, "scroll_n": None, "ts": None}
+
+class AppCrashError(Exception):
+    """Sinaliza que o app parece ter caido/travado (watchdog ou dialogo irrecuperavel).
+    Nunca deve ser 'engolido' por um except Exception generico no meio do caminho --
+    tem que subir ate o loop de retomada (_rodar_aba_resiliente)."""
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -382,6 +405,14 @@ def salvar(url, nome_tela=None, aba=""):
             nomes_salvos.add(chave_nome)
         if chave_versao is not None:
             qualidades_salvas[chave_versao].add(qualidade)
+        # Nome BASE (sem qualidade) -- permite pular clique em cards repetidos entre
+        # sub-abas da mesma categoria (ex: mesmo filme em "Acao" e "Lancamentos"). So
+        # p/ Filme/Infantil/Outro (series podem ganhar episodios novos, canais sao
+        # sempre entradas distintas de proposito) e NUNCA usado p/ bloquear salvar().
+        if tipo in ("filme", "infantil", "outro"):
+            base_key = chave_nome_normalizada(meta.get("nome_base") or nome_exibicao)
+            if len(base_key) >= 8:
+                nomes_base_salvos.add(base_key)
         stats[cat] += 1
         total = sum(stats.values())
         log(f"  SALVO [{cat}] [{total:>4}] {nome_exibicao}", "OK")
@@ -438,7 +469,10 @@ def carregar_qualidades_salvas():
         log(f"  Qualidade: {len(qualidades_salvas)} titulos/episodios com versao(oes) registrada(s)", "INFO")
 
 def carregar_estado_visitados():
-    """Carrega itens ja clicados/extraidos em sessoes anteriores (resume real, sobrevive a reinicios)."""
+    """Carrega o ciclo de vida dos itens de sessoes anteriores (resume real, sobrevive a
+    reinicios/crash). Cada linha pode ser uma lista simples (formato antigo, sempre
+    equivale a 'concluido') ou um objeto {"chave":[...], "status":...} (formato novo);
+    o arquivo e append-only, entao a ULTIMA ocorrencia de cada chave manda no status."""
     if not os.path.exists(ESTADO_PATH):
         return
     try:
@@ -448,25 +482,50 @@ def carregar_estado_visitados():
                 if not linha:
                     continue
                 try:
-                    _visitados_global.add(tuple(json.loads(linha)))
+                    dado = json.loads(linha)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
+                if isinstance(dado, list):
+                    chave, status = tuple(dado), "concluido"
+                elif isinstance(dado, dict) and "chave" in dado:
+                    chave, status = tuple(dado["chave"]), dado.get("status", "concluido")
+                else:
+                    continue
+                _visitados_status[chave] = status
     except OSError as e:
         log(f"  Falha ao carregar estado de visitados: {e}", "WARN")
         return
-    if _visitados_global:
-        log(f"  Estado anterior: {len(_visitados_global)} itens ja visitados", "INFO")
+    pendentes = 0
+    for chave, status in _visitados_status.items():
+        if status == "em_processo":
+            pendentes += 1
+        if len(chave) == 4 and chave[0] == "card" and chave[1] == "phash":
+            _phash_registro[chave[2]].append(chave[3])
+    if _visitados_status:
+        log(f"  Estado anterior: {len(_visitados_status)} itens registrados", "INFO")
+    if pendentes:
+        log(f"  {pendentes} item(ns) ficaram 'em_processo' num crash anterior -- serao re-processados.", "WARN")
 
 def foi_visitado(chave):
-    return chave in _visitados_global
+    return _visitados_status.get(chave) == "concluido"
 
-def marcar_visitado(chave):
-    _visitados_global.add(chave)
+def _gravar_estado(chave, status):
+    _visitados_status[chave] = status
     try:
         with open(ESTADO_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(list(chave), ensure_ascii=False) + "\n")
+            f.write(json.dumps({"chave": list(chave), "status": status}, ensure_ascii=False) + "\n")
     except OSError as e:
         log(f"  Falha ao gravar estado de visitados: {e}", "WARN")
+
+def marcar_em_processo(chave):
+    """Grava ANTES de clicar/abrir o item -- se o app crashar no meio, na retomada esse
+    item NAO fica marcado como concluido, entao volta a ser tentado (nunca perde link)."""
+    _gravar_estado(chave, "em_processo")
+
+def marcar_concluido(chave):
+    """Grava DEPOIS que o item terminou de ser processado -- so a partir daqui ele e
+    pulado nas proximas sessoes/tentativas."""
+    _gravar_estado(chave, "concluido")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ADB HELPERS
@@ -497,33 +556,70 @@ def adb_su(command, timeout=15):
 
 def tap(x, y, delay=WAIT_NAV):
     adb_run(["input","tap",str(int(x)),str(int(y))])
+    _invalidar_cache_tela()
     time.sleep(delay)
 
 def back(delay=WAIT_BACK):
     adb_run(["input","keyevent","4"])
+    _invalidar_cache_tela()
     time.sleep(delay)
 
 def swipe_up(dist=700, dur=350):
     cx = TELA_W // 2; cy = TELA_H // 2
     adb_run(["input","swipe",str(cx),str(cy+dist//2),str(cx),str(cy-dist//2),str(dur)])
+    _invalidar_cache_tela()
     time.sleep(0.9)
 
 def swipe_left(dist=600, dur=300, y=None):
     if y is None: y = TELA_H // 3
     x_ini = TELA_W * 3 // 4; x_fim = TELA_W // 4
     adb_run(["input","swipe",str(x_ini),str(y),str(x_fim),str(y),str(dur)])
+    _invalidar_cache_tela()
     time.sleep(0.8)
 
-def get_ui_xml():
+_ui_cache     = {"xml": "", "ts": 0.0}
+_UI_CACHE_TTL = 1.5
+
+def _invalidar_cache_tela():
+    _ui_cache["ts"] = 0.0
+
+def get_ui_xml(forcar=False):
+    """Dump da arvore de UI, com cache curto (TTL) pra nao re-dumpar a MESMA tela varias
+    vezes seguidas (cada dump custa 2 idas ao ADB: uiautomator dump + cat). Qualquer
+    tap/swipe invalida o cache na hora, entao nunca ha risco de ler uma tela desatualizada."""
+    agora = time.time()
+    if not forcar and _ui_cache["xml"] and (agora - _ui_cache["ts"]) < _UI_CACHE_TTL:
+        return _ui_cache["xml"]
     adb_run(["uiautomator","dump","/sdcard/ui.xml"])
     try:
         r = subprocess.run(["adb","shell","cat","/sdcard/ui.xml"],
                            capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=12)
-        return r.stdout
+        xml = r.stdout
     except subprocess.TimeoutExpired:
         log("  [ADB] Timeout lendo ui.xml", "WARN")
-        return ""
+        xml = ""
+    _ui_cache["xml"], _ui_cache["ts"] = xml, agora
+    return xml
+
+def app_esta_saudavel():
+    """Checagem barata (2 comandos ADB curtos) de que o app ainda esta vivo e em
+    primeiro plano. Chamada nos pontos de maior risco: antes de abrir um item novo e
+    logo apos cada memory dump (o dumpheap pode derrubar o app por pressao de memoria)."""
+    pid = adb_run(["pidof", APP_PACKAGE])
+    if not pid.strip():
+        return False
+    foco = adb_run(["dumpsys", "window", "|", "grep", "mCurrentFocus"])
+    return APP_PACKAGE in foco
+
+def app_saudavel_ou_recuperado():
+    """Antes de declarar crash de vez: confirma que o app esta vivo/em foco; se nao
+    estiver, tenta primeiro fechar um dialogo de erro/ANR (nem sempre e crash de verdade)."""
+    if app_esta_saudavel():
+        return True
+    if tentar_lidar_com_dialogo() and app_esta_saudavel():
+        return True
+    return False
 
 def parse_xml(xml_str):
     try:
@@ -548,26 +644,43 @@ def bounds_area(coords):
         return 0
     return (coords[2]-coords[0]) * (coords[3]-coords[1])
 
-def capturar_screenshot_recorte(bounds_str):
-    """Tira um screenshot do device e recorta a area do node (para OCR)."""
+def capturar_screenshot_recorte(bounds_str, img_tela=None):
+    """Recorta a area do node a partir de um screenshot ja capturado (compartilhado entre
+    varios cards da mesma leitura de tela); se nenhum for passado, tira um novo sozinho
+    (comportamento antigo, mantido p/ quem ainda chama isolado)."""
+    if img_tela is None:
+        img_tela = tirar_screenshot()
+    return _recortar(img_tela, bounds_str)
+
+def tirar_screenshot():
+    """Um unico screencap da tela atual -- compartilhado entre OCR e fingerprint visual
+    (pHash) de TODOS os cards dessa leitura, em vez de um screencap por card."""
+    if not PIL_DISPONIVEL:
+        return None
+    try:
+        r = subprocess.run(["adb","exec-out","screencap","-p"], capture_output=True, timeout=15)
+        if r.returncode != 0 or not r.stdout:
+            return None
+        return Image.open(io.BytesIO(r.stdout))
+    except Exception:
+        return None
+
+def _recortar(img, bounds_str):
+    if img is None:
+        return None
     coords = bounds_coords(bounds_str)
     if len(coords) < 4:
         return None
     try:
-        r = subprocess.run(["adb","exec-out","screencap","-p"],
-                           capture_output=True, timeout=15)
-        if r.returncode != 0 or not r.stdout:
-            return None
-        img = Image.open(io.BytesIO(r.stdout))
         return img.crop((coords[0], coords[1], coords[2], coords[3]))
     except Exception:
         return None
 
-def ler_nome_por_ocr(bounds_str):
+def ler_nome_por_ocr(bounds_str, img_tela=None):
     """Fallback: le o nome via OCR na imagem quando a acessibilidade nao retorna texto."""
     if not OCR_DISPONIVEL or not bounds_str:
         return ""
-    img = capturar_screenshot_recorte(bounds_str)
+    img = capturar_screenshot_recorte(bounds_str, img_tela)
     if img is None:
         return ""
     try:
@@ -577,6 +690,47 @@ def ler_nome_por_ocr(bounds_str):
     except Exception as e:
         log(f"  [OCR] Falha ao ler imagem: {e}", "WARN")
         return ""
+
+def _phash_imagem(img, tamanho=8):
+    """Hash perceptual simples (aHash): reduz o recorte a tamanho x tamanho em escala de
+    cinza e marca 1 bit por pixel (acima/abaixo da media) -- suficiente pra saber se dois
+    recortes de tela sao 'visualmente o mesmo card' sem precisar de nada alem do Pillow."""
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    pequena  = img.convert("L").resize((tamanho, tamanho), resample)
+    pixels   = list(pequena.getdata())
+    media   = sum(pixels) / len(pixels)
+    bits = 0
+    for p in pixels:
+        bits = (bits << 1) | (1 if p >= media else 0)
+    return bits
+
+def _hamming(a, b):
+    return bin(a ^ b).count("1")
+
+def _phash_equivalente(label, novo_hash):
+    for h in _phash_registro[label]:
+        if _hamming(novo_hash, h) <= _LIMIAR_PHASH:
+            return h
+    return None
+
+def chave_fingerprint_card(label, card, img_tela, scroll_n):
+    """Chave estavel pra cards SEM nome confiavel: usa hash perceptual do recorte visual
+    (estavel entre posicoes de scroll) em vez de bounds+scroll_n (que mudam a cada rolagem
+    e faziam o mesmo card sem texto 'reaparecer como novo' -- causa raiz de clique
+    duplicado em cards sem nome). Cai pro fallback antigo se o Pillow nao estiver
+    disponivel ou der qualquer erro (sem regressao nesse caso)."""
+    try:
+        recorte = _recortar(img_tela, card["bounds"])
+        if recorte is not None:
+            novo_hash  = _phash_imagem(recorte)
+            existente  = _phash_equivalente(label, novo_hash)
+            hash_final = existente if existente is not None else novo_hash
+            if existente is None:
+                _phash_registro[label].append(novo_hash)
+            return ("card", "phash", label, hash_final)
+    except Exception as e:
+        log(f"  [PHASH] Falha ao gerar fingerprint: {e}", "WARN")
+    return ("card", label, scroll_n, card["bounds"])
 
 def encontrar_no(root, texto=None, res_id=None):
     if root is None:
@@ -751,6 +905,11 @@ def extrair_link_memoria(nome_tela, aba="", _tentativa=1):
         log(f"  [ERRO] dumpheap falhou: {dump_msg[:180]}", "ERR")
         return False
 
+    # dumpheap pode derrubar o app por pressao de memoria -- checagem barata logo apos,
+    # ANTES de gastar tempo puxando/varrendo um dump de um app que ja caiu.
+    if not app_saudavel_ou_recuperado():
+        raise AppCrashError(f"App nao respondia logo apos o memory dump (item: {nome_tela})")
+
     tam_remoto = aguardar_dump_pronto(remoto)
     if tam_remoto <= 0:
         log("  [ERRO] dumpheap arquivo vazio", "ERR")
@@ -867,6 +1026,60 @@ def detectar_tela(root):
         if any(p in txt for p in ["assistir","watch","ver agora","play now"]):
             return "detalhe"
     return "lista"
+
+_TEXTOS_DIALOGO_SISTEMA = ("isn't responding", "não está respondendo", "nao esta respondendo",
+                           "wait", "esperar", "close app", "fechar app")
+_TEXTOS_DIALOGO_APP     = ("falha na reprodução", "falha na reproducao", "erro ao reproduzir",
+                           "playback error", "erro de reprodução", "tente novamente",
+                           "não foi possível", "nao foi possivel")
+
+def detectar_dialogo_erro(root):
+    """Distingue dialogo de ERRO DO APP (ex: 'Falha na reproducao') de ANR/crash do
+    SISTEMA Android (ex: '"Every Cine" isn't responding'). So retorna algo se achar texto
+    tipico de um dos dois -- nao interfere em telas normais. Retorna (tipo, botoes) onde
+    tipo e 'sistema'|'app'|None e botoes e um dict com coords de 'esperar'/'fechar'."""
+    if root is None:
+        return None, {}
+    textos = []
+    for node in root.iter("node"):
+        txt = (node.get("text") or "").strip()
+        if txt:
+            textos.append((txt.lower(), node))
+    corpo = " ".join(t for t, _ in textos)
+    if any(p in corpo for p in _TEXTOS_DIALOGO_SISTEMA):
+        tipo = "sistema"
+    elif any(p in corpo for p in _TEXTOS_DIALOGO_APP):
+        tipo = "app"
+    else:
+        return None, {}
+    botoes = {}
+    for txt, node in textos:
+        if node.get("clickable") != "true":
+            continue
+        if any(k in txt for k in ("esperar", "wait")):
+            botoes["esperar"] = bounds_centro(node.get("bounds", ""))
+        elif any(k in txt for k in ("fechar", "close", "ok", "tente novamente")):
+            botoes["fechar"] = bounds_centro(node.get("bounds", ""))
+    return tipo, botoes
+
+def tentar_lidar_com_dialogo():
+    """Antes de declarar crash: verifica se e so um dialogo (erro do app ou ANR do
+    sistema) que da pra fechar sozinho. Retorna True se achou e tentou lidar com algo."""
+    root = parse_xml(get_ui_xml(forcar=True))
+    tipo, botoes = detectar_dialogo_erro(root)
+    if tipo is None:
+        return False
+    if tipo == "sistema":
+        alvo = botoes.get("esperar") or botoes.get("fechar")
+        log("  [DIALOGO] ANR do sistema detectado, tentando 'Esperar/Fechar'...", "WARN")
+    else:
+        alvo = botoes.get("fechar")
+        log("  [DIALOGO] Dialogo de erro do app detectado, fechando...", "WARN")
+    if alvo and alvo[0] is not None:
+        tap(*alvo, delay=1.5)
+    else:
+        back(delay=1.5)
+    return True
 
 RID_RECOMENDACAO = ("recommend","similar","related","you_may","see_also","relacionado","see_all")
 
@@ -1089,7 +1302,11 @@ def processar_episodios(root_detalhe, nome_serie):
             chave_ep = ("ep", nome_serie, nome_key, ep["rid"]) if nome_key and nome_key != "???" else ("ep", nome_serie, scroll_ep, ep["bounds"])
             if foi_visitado(chave_ep):
                 continue
-            marcar_visitado(chave_ep)
+
+            if not app_saudavel_ou_recuperado():
+                raise AppCrashError(f"App nao respondia antes do episodio '{ep['nome']}' de '{nome_serie}'")
+
+            marcar_em_processo(chave_ep)
             novos_ep += 1
 
             nome_ep = f"{nome_serie} - {ep['nome']}" if ep['nome'] not in ("???","") else nome_serie
@@ -1108,6 +1325,8 @@ def processar_episodios(root_detalhe, nome_serie):
             else:
                 log(f"    [EP] Tela inesperada '{tela}', voltando...", "WARN")
                 voltar_para_tela("detalhe", max_tentativas=3)
+
+            marcar_concluido(chave_ep)
 
         if novos_ep == 0:
             sem_novos_ep += 1
@@ -1234,6 +1453,8 @@ def processar_item(card, profundidade=0):
                 log(f"     [SKIP] Sem subcard valido.", "WARN")
             voltar_para_tela("lista")
 
+    except AppCrashError:
+        raise
     except Exception as e:
         log(f"     [ERRO] Falha em '{nome}': {e}", "ERR")
         voltar_para_tela("lista", max_tentativas=3)
@@ -1241,29 +1462,47 @@ def processar_item(card, profundidade=0):
 # ══════════════════════════════════════════════════════════════════════════════
 #  PROCESSAMENTO DE ABAS
 # ══════════════════════════════════════════════════════════════════════════════
+def _label_permite_precheck_titulo(label):
+    """So pula clique por 'nome-ja-salvo' pra Filmes/Infantil/Outros -- Series precisa
+    abrir o card pra ver a lista de episodios (o mesmo nome pode ter episodios novos), e
+    canais nunca usam esse atalho (cada praca/variante e uma entrada de proposito)."""
+    l = label.lower()
+    return not (l.startswith("ao vivo") or l.startswith("series") or l.startswith("séries"))
+
 def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
     """Processa os cards ainda nao visitados dessa leva. Em vez de confiar numa lista de
     coordenadas 'congelada' no momento da captura, RELE a tela ao vivo antes de cada
     clique -- se o scroll mudar de posicao por qualquer motivo entre um card e outro
     (ex: voltar da tela de detalhe nao preservou o lugar certo), o proximo alvo e
     recalculado certinho, em vez de clicar as cegas em coordenadas que agora apontam
-    pra outra coisa (era isso que fazia o robo clicar varias vezes no mesmo item)."""
+    pra outra coisa (era isso que fazia o robo clicar varias vezes no mesmo item).
+    Cards sem nome confiavel usam fingerprint visual (pHash) em vez de bounds+scroll_n
+    (que mudam a cada rolagem -- causa raiz do clique duplicado em cards sem texto)."""
     novos     = 0
     ys_regiao = {c["cy"] for c in cards}
     while True:
         root_atual = parse_xml(get_ui_xml())
         candidatos = [c for c in coletar_cards(root_atual) if any(abs(c["cy"] - y) <= 90 for y in ys_regiao)]
+        img_tela   = tirar_screenshot() if any(c["nome"] == "???" for c in candidatos) else None
 
         card_alvo, chave_alvo = None, None
         for card in candidatos:
             if card["nome"] == "???":
-                ocr_nome = ler_nome_por_ocr(card["bounds"])
+                ocr_nome = ler_nome_por_ocr(card["bounds"], img_tela)
                 if ocr_nome:
                     log(f"  [OCR] Card lido por imagem: {ocr_nome}", "NAV")
                     card["nome"] = ocr_nome
 
             nome_key = card["nome"].strip().lower()
-            chave = ("card", label, nome_key, card["rid"]) if nome_key and nome_key != "???" else ("card", label, scroll_n, card["bounds"])
+            if nome_key and nome_key != "???":
+                if _label_permite_precheck_titulo(label):
+                    base_key = chave_nome_normalizada(nome_key)
+                    if len(base_key) >= 8 and base_key in nomes_base_salvos:
+                        continue  # titulo ja capturado antes (em outra sub-aba/carrossel) -- pula sem clicar
+                chave = ("card", label, nome_key, card["rid"])
+            else:
+                chave = chave_fingerprint_card(label, card, img_tela, scroll_n)
+
             if foi_visitado(chave):
                 continue
             card_alvo, chave_alvo = card, chave
@@ -1272,13 +1511,17 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
         if card_alvo is None:
             break  # nenhum card novo nessa faixa de tela -- acabou
 
-        marcar_visitado(chave_alvo)
+        if not app_saudavel_ou_recuperado():
+            raise AppCrashError(f"App nao respondia antes de abrir '{card_alvo['nome']}' (aba '{label}')")
+
+        marcar_em_processo(chave_alvo)
         novos += 1
         processar_item(card_alvo)
         # processar_item ja tenta voltar pra lista via BOTAO BACK (preserva o scroll).
         # So tateia a aba como ultimo recurso se realmente ficou preso em outra tela.
         if detectar_tela(parse_xml(get_ui_xml())) != "lista":
             tap(tap_x, tap_y, delay=1.5)
+        marcar_concluido(chave_alvo)
     return novos
 
 def _linhas_do_snapshot(cards, tolerancia=90):
@@ -1292,21 +1535,24 @@ def _linhas_do_snapshot(cards, tolerancia=90):
 
 def _explorar_carrosseis_horizontais(label, tap_x, tap_y, scroll_n):
     """Cada fileira da tela pode ter seu proprio carrossel horizontal (ex: 'Filmes em Alta').
-    Arrasta cada fileira para o lado ate o carrossel parar de se mover (fim da lista)."""
+    Arrasta cada fileira para o lado ate o carrossel parar de se mover (fim da lista) OU
+    ate reaparecer um estado ja visto (carrossel em loop/infinito, volta ao inicio) --
+    antes so comparava com o frame IMEDIATAMENTE anterior, entao um carrossel que da a
+    volta completa nunca era detectado (o novo frame so repetia o PRIMEIRO, nao o ultimo)."""
     root   = parse_xml(get_ui_xml())
     linhas = _linhas_do_snapshot(coletar_cards(root))
 
     total = 0
     for y_linha in linhas:
-        anterior = None
+        vistos_frames = set()
         for _ in range(MAX_SWIPE_LINHA):
             swipe_left(y=y_linha)
             root_h  = parse_xml(get_ui_xml())
             cards_h = [c for c in coletar_cards(root_h) if abs(c["cy"] - y_linha) <= 90]
             atual   = tuple(c["bounds"] for c in cards_h)
-            if atual == anterior:
-                break  # arrasto nao mudou nada: chegou ao fim do carrossel
-            anterior = atual
+            if atual in vistos_frames:
+                break  # fim do carrossel OU deu a volta (loop) -- para de arrastar
+            vistos_frames.add(atual)
             total += _processar_lista_cards(cards_h, label, tap_x, tap_y, scroll_n)
     return total
 
@@ -1321,6 +1567,8 @@ def processar_aba(label, tap_x, tap_y):
     sem_novo    = 0
 
     for scroll_n in range(MAX_SCROLL):
+        if scroll_n % 3 == 0:
+            _atualizar_checkpoint(scroll_n=scroll_n)
         xml   = get_ui_xml()
         root  = parse_xml(xml)
         cards = coletar_cards(root)
@@ -1377,7 +1625,10 @@ def processar_aba_com_subabas(label, tap_x, tap_y):
         log(f"  Sub-abas em '{label}': {[s['label'] for s in sub_abas]}", "INFO")
         for sub in sub_abas:
             try:
+                _atualizar_checkpoint(sub_aba=sub['label'])
                 processar_aba(f"{label}/{sub['label']}", sub["cx"], sub["cy"])
+            except AppCrashError:
+                raise
             except Exception as e:
                 log(f"  [ERRO] Sub-aba '{sub['label']}': {e}", "ERR")
     else:
@@ -1400,6 +1651,89 @@ def iniciar_app_limpo():
         back(delay=2) if tela != "desconhecida" else time.sleep(2)
     log("  Nao confirmei tela inicial, continuando.", "WARN")
     return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CHECKPOINT DE POSICAO + RECUPERACAO DE CRASH
+# ══════════════════════════════════════════════════════════════════════════════
+def _atualizar_checkpoint(aba=None, sub_aba=None, scroll_n=None):
+    """Registra em que ponto da navegacao o robo esta (Log/estado_posicao.json) -- usado
+    na recuperacao de crash (contexto no log) e, no boot de uma execucao nova, pra saber
+    de qual aba retomar em vez de comecar do zero. Sobrescreve sempre (so importa o
+    ultimo estado, nao e um log historico)."""
+    if aba is not None:
+        _checkpoint_atual["aba"] = aba
+        _checkpoint_atual["sub_aba"] = None
+    if sub_aba is not None:
+        _checkpoint_atual["sub_aba"] = sub_aba
+    if scroll_n is not None:
+        _checkpoint_atual["scroll_n"] = scroll_n
+    _checkpoint_atual["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(_checkpoint_atual, f, ensure_ascii=False)
+    except OSError as e:
+        log(f"  Falha ao gravar checkpoint: {e}", "WARN")
+
+def ler_checkpoint():
+    if not os.path.exists(CHECKPOINT_PATH):
+        return None
+    try:
+        with open(CHECKPOINT_PATH, encoding="utf-8", errors="replace") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def limpar_checkpoint():
+    """So chamado quando TODAS as abas selecionadas terminam normalmente -- assim a
+    proxima execucao nao fica enviesada pra retomar numa aba que ja foi concluida."""
+    try:
+        if os.path.exists(CHECKPOINT_PATH):
+            os.remove(CHECKPOINT_PATH)
+    except OSError:
+        pass
+
+def registrar_crash():
+    """Contador de crashes numa janela deslizante, com backoff progressivo (30/60/120s).
+    Retorna os segundos de espera antes de tentar de novo, ou None se estourou o limite
+    (a aba correspondente deve ser pulada em vez de insistir num crash-loop)."""
+    agora = time.time()
+    _crash_timestamps.append(agora)
+    while _crash_timestamps and agora - _crash_timestamps[0] > _CRASH_JANELA_SEG:
+        _crash_timestamps.pop(0)
+    n = len(_crash_timestamps)
+    if n > _CRASH_LIMITE:
+        return None
+    return {1: 30, 2: 60, 3: 120}.get(n, 120)
+
+def recuperar_de_crash(motivo):
+    """Reinicia o app do zero apos uma queda/trava. A re-navegacao ate a aba/sub-aba
+    certa fica a cargo da PROPRIA funcao da aba (fn(), chamada de novo por
+    _rodar_aba_resiliente) -- ela sempre parte do menu Inicio, entao reabrir o app aqui
+    e deixar o fluxo normal repetir o tap ja resolve, sem duplicar logica de navegacao."""
+    ck = _checkpoint_atual
+    log(f"  [CRASH] {motivo} | ultimo checkpoint: aba={ck.get('aba')} "
+        f"sub_aba={ck.get('sub_aba')} scroll_n={ck.get('scroll_n')}", "ERR")
+    iniciar_app_limpo()
+
+def _rodar_aba_resiliente(chave):
+    """Executa a funcao de uma aba com protecao contra crash do app: se o app cair ou
+    travar no meio (AppCrashError ou excecao inesperada), reinicia e tenta de novo -- o
+    estado de visitados (em_processo/concluido) + qualidades ja salvas garantem que nada
+    e reprocessado nem perdido. So desiste da aba se crashar demais em pouco tempo."""
+    rotulo, fn = ABAS_DISPONIVEIS[chave]
+    while True:
+        _atualizar_checkpoint(aba=chave)
+        try:
+            fn()
+            return
+        except Exception as e:
+            backoff = registrar_crash()
+            if backoff is None:
+                log(f"  [CRASH] Muitos crashes em pouco tempo, pulando aba '{rotulo}'.", "ERR")
+                return
+            log(f"  [CRASH] Falha na aba '{rotulo}': {e} -- recuperando em {backoff}s...", "ERR")
+            time.sleep(backoff)
+            recuperar_de_crash(f"Excecao na aba '{rotulo}'")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  RELATORIO FINAL
@@ -1505,6 +1839,15 @@ if __name__ == "__main__":
     args = _parser.parse_args()
     abas_selecionadas = list(ABAS_DISPONIVEIS.keys()) if "todas" in args.abas else args.abas
 
+    # Retomada apos reinicio TOTAL do processo (nao so do app): se ha um checkpoint de
+    # uma execucao anterior interrompida e o usuario nao escolheu abas especificas,
+    # comeca direto por onde parou em vez de do zero (Regra 1.2).
+    _ck_boot = ler_checkpoint()
+    if _ck_boot and _ck_boot.get("aba") in ABAS_DISPONIVEIS and "todas" in args.abas:
+        _idx = abas_selecionadas.index(_ck_boot["aba"])
+        abas_selecionadas = abas_selecionadas[_idx:] + abas_selecionadas[:_idx]
+        log(f"Checkpoint anterior encontrado: retomando direto na aba '{_ck_boot['aba']}'.", "INFO")
+
     BANNER = """
 +============================================================+
 |   ROBO EXTRATOR IPTV  *  GENIUS 7.1  (Memory Dump)        |
@@ -1543,11 +1886,8 @@ if __name__ == "__main__":
 
     try:
         for _chave in abas_selecionadas:
-            _rotulo, _fn = ABAS_DISPONIVEIS[_chave]
-            try:
-                _fn()
-            except Exception as e:
-                log(f"[ERRO] Aba '{_rotulo}': {e}", "ERR")
+            _rodar_aba_resiliente(_chave)
+        limpar_checkpoint()  # terminou tudo normalmente -- proxima execucao comeca do zero
     except KeyboardInterrupt:
         log("\nParado pelo usuario (Ctrl+C).", "WARN")
     finally:
