@@ -86,6 +86,7 @@ _erros_sessao         = []
 _tmdb_cache           = {}
 _visitados_status     = {}                 # chave (tuple) -> "em_processo" | "concluido"
 _phash_registro       = defaultdict(list)  # label -> [hash, hash, ...] ja conhecidos (fingerprint de cards sem nome)
+_ancoras_horizontais  = {}                 # cy_fileira -> {"cx", "phash", "nome_ui"} (usado p/ evitar repeticao de cliques em carrosseis)
 ESTADO_PATH           = os.path.join(LOG_DIR, "estado_visitados.jsonl")
 CATALOGO_PATH         = os.path.join(LOG_DIR, "catalogo.jsonl")
 CHECKPOINT_PATH       = os.path.join(LOG_DIR, "estado_posicao.json")
@@ -1584,7 +1585,7 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
             ancora_vista = next((c for c in candidatos if c["phash"] == ancora["phash"] or c["nome"].strip().lower() == ancora["nome_ui"]), None)
             if ancora_vista and ancora_vista["cx"] < ancora["cx"]:
                 log(f"  [RESET] Carrossel retrocedeu (Ancora moveu para {ancora_vista['cx']}, era {ancora['cx']}). Dando swipe...", "WARN")
-                swipe_left(y=y_fileira, x_start=900, x_end=200)
+                swipe_left(y=y_fileira)
                 continue # Re-le a tela
         
         card_alvo, chave_alvo = None, None
@@ -1661,15 +1662,23 @@ def _linhas_do_snapshot(cards, tolerancia=90):
 def _explorar_carrosseis_horizontais(label, tap_x, tap_y, scroll_n):
     """Cada fileira da tela pode ter seu proprio carrossel horizontal (ex: 'Filmes em Alta').
     Arrasta cada fileira para o lado ate o carrossel parar de se mover (fim da lista) OU
-    ate reaparecer um estado ja visto (carrossel em loop/infinito, volta ao inicio) --
-    antes so comparava com o frame IMEDIATAMENTE anterior, entao um carrossel que da a
-    volta completa nunca era detectado (o novo frame so repetia o PRIMEIRO, nao o ultimo)."""
+    ate reaparecer um estado ja visto (carrossel em loop/infinito, volta ao inicio)."""
     root   = parse_xml(get_ui_xml())
     linhas = _linhas_do_snapshot(coletar_cards(root))
 
     total = 0
     for y_linha in linhas:
         vistos_frames = set()
+        
+        # 1. Processa o frame VISIVEL ATUAL da linha ANTES de swipar!
+        # Isso evita pular os primeiros filmes da 2a, 3a, 4a fileiras.
+        root_h = parse_xml(get_ui_xml())
+        cards_h = [c for c in coletar_cards(root_h) if abs(c["cy"] - y_linha) <= 90]
+        if cards_h:
+            vistos_frames.add(tuple(c["bounds"] for c in cards_h))
+            total += _processar_lista_cards(cards_h, label, tap_x, tap_y, scroll_n)
+            
+        # 2. Inicia o loop de Swipe Horizontal
         for _ in range(MAX_SWIPE_LINHA):
             swipe_left(y=y_linha)
             root_h  = parse_xml(get_ui_xml())
@@ -1679,86 +1688,178 @@ def _explorar_carrosseis_horizontais(label, tap_x, tap_y, scroll_n):
                 break  # fim do carrossel OU deu a volta (loop) -- para de arrastar
             vistos_frames.add(atual)
             total += _processar_lista_cards(cards_h, label, tap_x, tap_y, scroll_n)
+            
     return total
 
-def processar_aba(label, tap_x, tap_y):
-    _aba_atual[0] = label
-    log(f"\n{'='*62}", "INFO")
-    log(f"  ABA: {label.upper()}", "INFO")
-    log(f"{'='*62}", "INFO")
 
-    tap(tap_x, tap_y, delay=2.5)
-
-    sem_novo    = 0
-
-    for scroll_n in range(MAX_SCROLL):
+def processar_grade_vertical(label, max_scrolls=MAX_SCROLL):
+    sem_novo = 0
+    total_novos = 0
+    for scroll_n in range(max_scrolls):
         if scroll_n % 3 == 0:
             _atualizar_checkpoint(scroll_n=scroll_n)
-        xml   = get_ui_xml()
-        root  = parse_xml(xml)
+        root  = parse_xml(get_ui_xml())
         cards = coletar_cards(root)
-
-        novos  = _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n)
-        novos += _explorar_carrosseis_horizontais(label, tap_x, tap_y, scroll_n)
-
+        novos = _processar_lista_cards(cards, label, 0, 0, scroll_n)
+        
+        # Opcional: _explorar_carrosseis_horizontais pode ser util se a grade contiver carrosseis,
+        # mas como "Ver mais" abre uma grade pura, _processar_lista_cards em teoria da conta de tudo.
+        # Por redundancia, mantemos a exploracao horizontal por via das duvidas:
+        novos += _explorar_carrosseis_horizontais(label, 0, 0, scroll_n)
+        
         if novos == 0:
             sem_novo += 1
             log(f"  [SCROLL {scroll_n+1}] Sem novos ({sem_novo}/4) | {progresso()}", "NAV")
             if sem_novo >= 4:
-                log(f"  Aba '{label}' concluida!", "OK")
                 break
         else:
             sem_novo = 0
             log(f"  [SCROLL {scroll_n+1}] {novos} itens processados | {progresso()}", "NAV")
-
+            total_novos += novos
+            
         swipe_up()
+        _ancoras_horizontais.clear()
+    return total_novos
 
-def processar_aba_com_subabas(label, tap_x, tap_y):
-    """Processa aba com sub-abas horizontais (Filmes > Acao, Drama...)."""
-    _aba_atual[0] = label
-    tap(tap_x, tap_y, delay=2.5)
-    time.sleep(1)
-
-    sub_abas   = []
-    vistos_sub = set()
-
-    # Coleta sub-abas iniciais + scroll horizontal para descobrir mais
-    for swipe_n in range(5):
-        xml  = get_ui_xml()
-        root = parse_xml(xml)
-        if root is not None:
-            for node in root.iter("node"):
-                if node.get("clickable") != "true":
-                    continue
-                bounds = node.get("bounds","")
-                txt    = (node.get("text") or "").strip()
+def _descobrir_secoes_e_chips(root, limiar_y=400):
+    itens = []
+    # Primeiro os chips (clicaveis simples na parte superior)
+    for node in root.iter("node"):
+        if node.get("clickable") == "true":
+            txt = (node.get("text") or "").strip()
+            if txt and txt.lower() not in IGNORAR_TEXTOS:
+                bounds = node.get("bounds", "")
                 coords = bounds_coords(bounds)
-                if len(coords) < 4:
-                    continue
-                # Sub-abas ficam no topo (y < 400)
-                if 80 < coords[1] < 400 and txt and txt not in vistos_sub:
-                    if txt.lower() in IGNORAR_TEXTOS or txt in ["Filmes","Series","Séries","Infantil","Home","Início","inicio"]:
-                        continue
+                if len(coords) == 4 and coords[1] < limiar_y:
                     cx, cy = bounds_centro(bounds)
-                    if cx:
-                        sub_abas.append({"label": txt, "cx": cx, "cy": cy})
-                        vistos_sub.add(txt)
-        if swipe_n < 4:
-            swipe_left(y=200)
+                    itens.append({"titulo": txt, "tipo": "chip", "cx": cx, "cy": cy, "bounds": bounds})
+    
+    # Secoes: buscar botoes "Ver mais" e associar titulo ao lado
+    botoes_ver_mais = []
+    for node in root.iter("node"):
+        if node.get("clickable") == "true":
+            txt = (node.get("text") or "").strip().lower()
+            desc = (node.get("content-desc") or "").strip().lower()
+            if "ver mais" in txt or "ver tudo" in txt or "ver todos" in txt or "ver mais" in desc or "ver tudo" in desc or "ver todos" in desc:
+                bounds = node.get("bounds", "")
+                coords = bounds_coords(bounds)
+                if len(coords) == 4:
+                    cx, cy = bounds_centro(bounds)
+                    botoes_ver_mais.append({"bounds": bounds, "cx": cx, "cy": cy, "node": node})
+    
+    for btn in botoes_ver_mais:
+        y_btn = btn["cy"]
+        titulo = None
+        for node in root.iter("node"):
+            txt = (node.get("text") or "").strip()
+            if txt and txt.lower() not in IGNORAR_TEXTOS:
+                bounds = node.get("bounds", "")
+                coords = bounds_coords(bounds)
+                if len(coords) == 4:
+                    cx, cy = bounds_centro(bounds)
+                    # Titulo costuma estar alinhado no eixo Y com o botao e mais a esquerda
+                    if abs(cy - y_btn) <= 70 and cx < btn["cx"]:
+                        titulo = txt
+                        break
+        if titulo:
+            itens.append({"titulo": titulo, "tipo": "secao", "cx": btn["cx"], "cy": btn["cy"], "bounds": btn["bounds"]})
+    return itens
 
-    if sub_abas:
-        log(f"  Sub-abas em '{label}': {[s['label'] for s in sub_abas]}", "INFO")
-        for sub in sub_abas:
-            try:
-                _atualizar_checkpoint(sub_aba=sub['label'])
-                processar_aba(f"{label}/{sub['label']}", sub["cx"], sub["cy"])
-            except AppCrashError:
-                raise
-            except Exception as e:
-                log(f"  [ERRO] Sub-aba '{sub['label']}': {e}", "ERR")
-    else:
-        log(f"  Sem sub-abas em '{label}', processando direto.", "INFO")
-        processar_aba(label, tap_x, tap_y)
+ABAS_NAV = {
+    'inicio':   {'modo': 'skip'},
+    'ao_vivo':  {'modo': 'chip', 'alvo': 'Todos'},
+    'filmes':   {'modo': 'todas_secoes'},
+    'series':   {'modo': 'secao', 'alvo': 'Todas'},
+    'infantil': {'modo': 'secao', 'alvo': 'Todos'}
+}
+
+def _abrir_aba_por_texto(texto, texto_alt=None):
+    tap(*MENU_INICIO, delay=2)
+    root = parse_xml(get_ui_xml())
+    n = encontrar_no(root, texto=texto)
+    if n is None and texto_alt:
+        n = encontrar_no(root, texto=texto_alt)
+    return n
+
+def processar_aba_adaptativa(chave_aba):
+    perfil = ABAS_NAV.get(chave_aba, {"modo": "skip"})
+    modo = perfil.get("modo")
+    alvo = perfil.get("alvo")
+    
+    if modo == "skip":
+        log(f"  Aba '{chave_aba}' pulada (cobertura redundante/skip).", "INFO")
+        return
+        
+    _aba_atual[0] = chave_aba
+    
+    # Navega para a aba correta
+    rotulos = {"inicio": ("Inicio", None), "ao_vivo": ("Ao vivo", None), "filmes": ("Filmes", None), "series": ("Series", "ries"), "infantil": ("Infantil", None)}
+    texto, texto_alt = rotulos[chave_aba]
+    n = _abrir_aba_por_texto(texto, texto_alt)
+    if n is None:
+        log(f"  Aba '{texto}' nao encontrada.", "WARN")
+        return
+    cx, cy = bounds_centro(n.get("bounds",""))
+    tap(cx, cy, delay=3)
+    
+    log(f"\n{'='*62}", "INFO")
+    log(f"  ABA: {texto.upper()}", "INFO")
+    log(f"{'='*62}", "INFO")
+
+    if modo == "chip":
+        root = parse_xml(get_ui_xml())
+        itens = _descobrir_secoes_e_chips(root)
+        chip = next((i for i in itens if i["tipo"] == "chip" and alvo.lower() in i["titulo"].lower()), None)
+        if chip:
+            log(f"  Clicando no chip '{chip['titulo']}'", "NAV")
+            tap(chip["cx"], chip["cy"], delay=2)
+        else:
+            log(f"  Chip alvo '{alvo}' nao encontrado. Processando padrao.", "WARN")
+        processar_grade_vertical(chave_aba)
+        log(f"  Aba '{texto}' concluida!", "OK")
+        
+    elif modo in ("secao", "todas_secoes"):
+        vistos_secoes = set()
+        alvo_processado = False
+        
+        for swipe_n in range(15):  # Limite de descidas buscando secoes
+            root = parse_xml(get_ui_xml())
+            itens = _descobrir_secoes_e_chips(root)
+            secoes = [i for i in itens if i["tipo"] == "secao"]
+            
+            if modo == "secao" and not alvo_processado:
+                secao_alvo = next((s for s in secoes if alvo.lower() in s["titulo"].lower()), None)
+                if secao_alvo:
+                    log(f"  Secao Alvo encontrada: '{secao_alvo['titulo']}'.", "INFO")
+                    _atualizar_checkpoint(secao=secao_alvo["titulo"])
+                    vistos_secoes.add(secao_alvo["titulo"])
+                    tap(secao_alvo["cx"], secao_alvo["cy"], delay=3)
+                    processar_grade_vertical(chave_aba)
+                    back(delay=2)
+                    alvo_processado = True
+                    log(f"  Demais secoes da aba '{texto}' puladas - ja cobertas por '{secao_alvo['titulo']}'.", "OK")
+                    return
+            
+            for s in secoes:
+                if s["titulo"] not in vistos_secoes:
+                    vistos_secoes.add(s["titulo"])
+                    if modo == "secao" and alvo_processado:
+                        continue
+                    if modo == "secao" and not alvo_processado and alvo.lower() not in s["titulo"].lower():
+                        log(f"  Secao '{s['titulo']}' pulada aguardando o alvo '{alvo}'.", "WARN")
+                        continue
+                        
+                    log(f"  Entrando na secao: '{s['titulo']}'", "INFO")
+                    _atualizar_checkpoint(secao=s["titulo"])
+                    tap(s["cx"], s["cy"], delay=3)
+                    processar_grade_vertical(chave_aba)
+                    back(delay=2)
+            
+            swipe_up()
+            _ancoras_horizontais.clear()
+            time.sleep(1)
+        
+        log(f"  Aba '{texto}' concluida!", "OK")
 
 def iniciar_app_limpo():
     log("  Reiniciando app...", "NAV")
@@ -1780,7 +1881,7 @@ def iniciar_app_limpo():
 # ══════════════════════════════════════════════════════════════════════════════
 #  CHECKPOINT DE POSICAO + RECUPERACAO DE CRASH
 # ══════════════════════════════════════════════════════════════════════════════
-def _atualizar_checkpoint(aba=None, sub_aba=None, scroll_n=None):
+def _atualizar_checkpoint(aba=None, sub_aba=None, scroll_n=None, secao=None):
     """Registra em que ponto da navegacao o robo esta (Log/estado_posicao.json) -- usado
     na recuperacao de crash (contexto no log) e, no boot de uma execucao nova, pra saber
     de qual aba retomar em vez de comecar do zero. Sobrescreve sempre (so importa o
@@ -1790,6 +1891,8 @@ def _atualizar_checkpoint(aba=None, sub_aba=None, scroll_n=None):
         _checkpoint_atual["sub_aba"] = None
     if sub_aba is not None:
         _checkpoint_atual["sub_aba"] = sub_aba
+    if secao is not None:
+        _checkpoint_atual["secao"] = secao
     if scroll_n is not None:
         _checkpoint_atual["scroll_n"] = scroll_n
     _checkpoint_atual["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1911,46 +2014,13 @@ def imprimir_relatorio(duracao, modo_noturno=False):
     log(f"  Log: {SESSION_LOG}", "INFO")
     log(f"{sep}", "OK")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ABAS (cada uma pode ser rodada isolada via --abas, sem precisar reprocessar tudo)
-# ══════════════════════════════════════════════════════════════════════════════
-def rodar_inicio():
-    processar_aba("Inicio", *MENU_INICIO)
 
-def rodar_ao_vivo():
-    processar_aba("Ao vivo", *MENU_AOVIVO)
-
-def _abrir_aba_por_texto(texto, texto_alt=None):
-    tap(*MENU_INICIO, delay=2)
-    root = parse_xml(get_ui_xml())
-    n = encontrar_no(root, texto=texto)
-    if n is None and texto_alt:
-        n = encontrar_no(root, texto=texto_alt)
-    return n
-
-def rodar_filmes():
-    n = _abrir_aba_por_texto("Filmes")
-    if n is not None:
-        cx, cy = bounds_centro(n.get("bounds",""))
-        processar_aba_com_subabas("Filmes", cx, cy)
-    else:
-        log("  Aba 'Filmes' nao encontrada na tela Inicio.", "WARN")
-
-def rodar_series():
-    n = _abrir_aba_por_texto("Series", "ries")
-    if n is not None:
-        cx, cy = bounds_centro(n.get("bounds",""))
-        processar_aba_com_subabas("Series", cx, cy)
-    else:
-        log("  Aba 'Series' nao encontrada na tela Inicio.", "WARN")
-
-def rodar_infantil():
-    n = _abrir_aba_por_texto("Infantil")
-    if n is not None:
-        cx, cy = bounds_centro(n.get("bounds",""))
-        processar_aba("Infantil", cx, cy)
-    else:
-        log("  Aba 'Infantil' nao encontrada na tela Inicio.", "WARN")
+# Chaves para main
+def rodar_inicio(): processar_aba_adaptativa("inicio")
+def rodar_ao_vivo(): processar_aba_adaptativa("ao_vivo")
+def rodar_filmes(): processar_aba_adaptativa("filmes")
+def rodar_series(): processar_aba_adaptativa("series")
+def rodar_infantil(): processar_aba_adaptativa("infantil")
 
 # chave usada em --abas -> (rotulo pra log, funcao que executa)
 ABAS_DISPONIVEIS = {
