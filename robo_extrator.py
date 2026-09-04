@@ -3,7 +3,11 @@ import urllib.request
 _phash_ativo = None
 urls_por_nome_limpo = {}
 urls_por_phash = {}
+
 _prioridade_urls_caidas = set()
+_prioridade_urls_vistas = set()
+_infra_falhou = False
+
 _urls_validadas_sessao = {}
 
 def carregar_sidecar_prioridade():
@@ -169,6 +173,114 @@ def progresso():
 # ══════════════════════════════════════════════════════════════════════════════
 #  CATEGORIZACAO E SALVAMENTO
 # ══════════════════════════════════════════════════════════════════════════════
+def processar_obitos():
+    if not args.focar_mortos:
+        return
+        
+    MORTOS_PATH = os.path.join(LOG_DIR, "links_mortos.jsonl")
+    TMP_PATH = os.path.join(LOG_DIR, "links_mortos.tmp.jsonl")
+    CATALOGO_MORTOS = os.path.join(LOG_DIR, "mortos", "catalogo_mortos.jsonl")
+    os.makedirs(os.path.join(LOG_DIR, "mortos"), exist_ok=True)
+    
+    if not os.path.exists(MORTOS_PATH):
+        return
+        
+    db_mortos = []
+    # 1. Update nao_encontrado_em_tela
+    with open(MORTOS_PATH, "r", encoding="utf-8") as f:
+        for linha in f:
+            if not linha.strip(): continue
+            try:
+                reg = json.loads(linha)
+                ukey = reg.get("url_key")
+                
+                # Resurreicao
+                if ukey in _prioridade_urls_vistas:
+                    reg["nao_encontrado_em_tela"] = 0
+                elif ukey in _prioridade_urls_caidas and not _infra_falhou:
+                    # Nao foi visto e n houve infra failure
+                    reg["nao_encontrado_em_tela"] = reg.get("nao_encontrado_em_tela", 0) + 1
+                    
+                db_mortos.append(reg)
+            except:
+                pass
+                
+    # 2. Gravar update
+    with open(TMP_PATH, "w", encoding="utf-8") as f:
+        for r in db_mortos:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(TMP_PATH, MORTOS_PATH)
+    
+    # 3. Assinar Obitos
+    if not args.assinar_obitos:
+        return
+        
+    import hashlib
+    obitos_keys = set()
+    manter_sidecar = []
+    
+    # Pegar quais serao mortos
+    for r in db_mortos:
+        net = r.get("nao_encontrado_em_tela", 0)
+        ukey = r.get("url_key")
+        cat = r.get("categoria", "")
+        
+        if net >= 3:
+            if cat == "Canais_AoVivo" and not args.confirmar_obitos:
+                log(f"[ATENCAO] Canal Ao Vivo '{ukey}' sumiu 3x. Requer --confirmar-obitos para arquivar.", "WARN")
+                manter_sidecar.append(r)
+            else:
+                obitos_keys.add(ukey)
+        else:
+            manter_sidecar.append(r)
+            
+    if not obitos_keys:
+        return
+        
+    # Extrair do catalogo e arquivar
+    CAT_TMP = os.path.join(LOG_DIR, "catalogo.tmp.jsonl")
+    linhas_catalogo = []
+    linhas_arquivadas = []
+    if os.path.exists(CATALOGO_PATH):
+        with open(CATALOGO_PATH, "r", encoding="utf-8") as f:
+            for linha in f:
+                if not linha.strip(): continue
+                try:
+                    reg_cat = json.loads(linha)
+                    ukey = reg_cat.get("url_key")
+                    if ukey in obitos_keys:
+                        # Assinar
+                        reg_cat["data_do_obito"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        reg_cat["motivo"] = "removido_da_grade"
+                        reg_cat["hash_entrada"] = hashlib.md5(f"{ukey}_{time.time()}".encode()).hexdigest()
+                        linhas_arquivadas.append(reg_cat)
+                        log(f"[OBITO] {reg_cat.get('nome')} (removido_da_grade)", "ERR")
+                    else:
+                        linhas_catalogo.append(linha)
+                except:
+                    linhas_catalogo.append(linha)
+                    
+        # Gravar catalogo novo
+        with open(CAT_TMP, "w", encoding="utf-8") as f:
+            f.writelines(linhas_catalogo)
+        os.replace(CAT_TMP, CATALOGO_PATH)
+        
+        # Gravar mortos
+        with open(CATALOGO_MORTOS, "a", encoding="utf-8") as f:
+            for arch in linhas_arquivadas:
+                f.write(json.dumps(arch, ensure_ascii=False) + "\n")
+                
+        # Gravar sidecar novo (sem os mortos)
+        with open(TMP_PATH, "w", encoding="utf-8") as f:
+            for r in manter_sidecar:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        os.replace(TMP_PATH, MORTOS_PATH)
+
+def main_obito_hook():
+    processar_obitos()
+
+
+
 def extrair_nome(url, nome_tela=None):
     if nome_tela and nome_tela.strip() not in ("???", "", "Live", "Todos"):
         return nome_tela.strip().title()
@@ -445,6 +557,9 @@ def salvar(url, nome_tela=None, aba=""):
             if url_antiga and url_antiga != url and url.startswith("http"):
                 log(f"  [RENOVACAO] {url_antiga} -> {url}", "OK")
                 
+        if args.focar_mortos:
+            _prioridade_urls_vistas.add(url_key)
+            
         gravar_m3u(cat, grupo, nome_exibicao, url)
         gravar_catalogo(url, url_key, tipo, cat, grupo, nome_exibicao, meta, aba)
 
@@ -1675,6 +1790,8 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
                         url_antiga = urls_por_nome_limpo.get(bkey)
                         if url_antiga:
                             ukey = chave_url(url_antiga)
+                            if args.focar_mortos:
+                                _prioridade_urls_vistas.add(ukey)
                             if args.focar_mortos and ukey in _prioridade_urls_caidas:
                                 log(f"  [PRIORIDADE] '{nome_limpo}' esta no sidecar de mortos! Forcando clique...", "WARN")
                             else:
@@ -1693,6 +1810,8 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
                 url_antiga = urls_por_phash.get(card["phash"])
                 if url_antiga:
                     ukey = chave_url(url_antiga)
+                    if args.focar_mortos:
+                        _prioridade_urls_vistas.add(ukey)
                     if args.focar_mortos and ukey in _prioridade_urls_caidas:
                         log(f"  [PRIORIDADE] pHash coincidente esta no sidecar de mortos! Forcando clique...", "WARN")
                     else:
@@ -1715,6 +1834,8 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
             break
 
         if not app_saudavel_ou_recuperado():
+            global _infra_falhou
+            _infra_falhou = True
             raise AppCrashError(f"App crash na aba '{label}'")
 
         marcar_em_processo(chave_alvo)
@@ -2139,8 +2260,11 @@ if __name__ == "__main__":
         "--focar-mortos", action="store_true",
         help="Foca apenas nos links identificados como mortos/suspeitos no links_mortos.jsonl"
     )
+    _parser.add_argument("--assinar-obitos", action="store_true", help="Move links nao achados em 3 sessoes p/ mortos")
+    _parser.add_argument("--confirmar-obitos", action="store_true", help="Confirma o atestado p/ Canais_AoVivo")
     args = _parser.parse_args()
     abas_selecionadas = list(ABAS_DISPONIVEIS.keys()) if "todas" in args.abas else args.abas
+
 
     # Retomada apos reinicio TOTAL do processo (nao so do app): se ha um checkpoint de
     # uma execucao anterior interrompida e o usuario nao escolheu abas especificas,
@@ -2198,3 +2322,4 @@ if __name__ == "__main__":
         duracao = int(time.time() - t_inicio)
         imprimir_relatorio(duracao, args.modo_noturno)
         input("\nPressione Enter para sair...")
+

@@ -124,7 +124,62 @@ def main():
     parser = argparse.ArgumentParser(description="Revalida links M3U8 do catalogo.")
     parser.add_argument("--incluir-ao-vivo", action="store_true", help="Revalidar Canais_AoVivo tambem (padrao: pular)")
     parser.add_argument("--loop-intervalo", type=int, default=0, help="Minutos para esperar e rodar de novo em loop (padrao: 0 = roda so uma vez)")
+    parser.add_argument("--restaurar", type=str, help="Titulo (ou hash/url) da midia a ser restaurada do arquivo de mortos")
+    parser.add_argument("--listar-mortos", action="store_true", help="Lista as midias atestadas como mortas")
     args = parser.parse_args()
+    
+    if args.listar_mortos:
+        MORTOS_CAT = os.path.join(LOG_DIR, "mortos", "catalogo_mortos.jsonl")
+        if not os.path.exists(MORTOS_CAT):
+            print("Nenhum obito registrado.")
+            return
+        print("=== LISTA DE OBITOS (ARQUIVADOS) ===")
+        with open(MORTOS_CAT, "r", encoding="utf-8") as f:
+            for l in f:
+                if not l.strip(): continue
+                r = json.loads(l)
+                print(f"[{r.get('data_do_obito')}] {r.get('categoria')} - {r.get('nome')} | Motivo: {r.get('motivo')} | Hash: {r.get('hash_entrada')}")
+        return
+        
+    if args.restaurar:
+        MORTOS_CAT = os.path.join(LOG_DIR, "mortos", "catalogo_mortos.jsonl")
+        TMP_MORTOS = os.path.join(LOG_DIR, "mortos", "catalogo_mortos.tmp.jsonl")
+        if not os.path.exists(MORTOS_CAT):
+            print("Arquivo de obitos nao encontrado.")
+            return
+            
+        alvo = args.restaurar.lower()
+        achou = False
+        restantes = []
+        restaurados = []
+        
+        with open(MORTOS_CAT, "r", encoding="utf-8") as f:
+            for l in f:
+                if not l.strip(): continue
+                r = json.loads(l)
+                if alvo in r.get("nome", "").lower() or alvo == r.get("hash_entrada"):
+                    restaurados.append(r)
+                    achou = True
+                else:
+                    restantes.append(r)
+                    
+        if achou:
+            with open(CATALOGO_PATH, "a", encoding="utf-8") as f:
+                for r in restaurados:
+                    # Strip obito fields
+                    r.pop("data_do_obito", None)
+                    r.pop("motivo", None)
+                    r.pop("hash_entrada", None)
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    print(f"[RESTAURACAO] '{r.get('nome')}' restaurado ao catalogo.")
+            with open(TMP_MORTOS, "w", encoding="utf-8") as f:
+                for r in restantes:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            os.replace(TMP_MORTOS, MORTOS_CAT)
+        else:
+            print(f"Nenhum obito encontrado correspondente a '{args.restaurar}'.")
+        return
+
 
     print("Carregando catalogo e base de mortos...")
     catalogo = carregar_catalogo()
