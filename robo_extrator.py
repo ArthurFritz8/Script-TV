@@ -1,3 +1,19 @@
+
+import urllib.request
+_phash_ativo = None
+urls_por_nome_limpo = {}
+urls_por_phash = {}
+
+def _validar_link_rapido(url):
+    if not url or not url.startswith('http'):
+        return False
+    try:
+        req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=3.0) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -360,6 +376,9 @@ def gravar_catalogo(url, url_key, tipo, cat, grupo, nome_exibicao, meta, aba):
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     registro.update(meta)
+    global _phash_ativo
+    if _phash_ativo:
+        registro["phash"] = _phash_ativo
     with open(CATALOGO_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(registro, ensure_ascii=False) + "\n")
 
@@ -467,7 +486,18 @@ def carregar_qualidades_salvas():
         chave_versao = chave_versao_item(reg.get("tipo"), reg, reg.get("nome") or "")
         if chave_versao is None:
             continue
+        
         qualidades_salvas[chave_versao].add(reg.get("qualidade"))
+        
+        nome_limpo = chave_nome_normalizada(reg.get("nome_base") or reg.get("nome") or "")
+        if nome_limpo:
+            urls_por_nome_limpo[nome_limpo] = reg.get("url")
+            nomes_base_salvos.add(nome_limpo)
+            
+        ph = reg.get("phash")
+        if ph:
+            urls_por_phash[ph] = reg.get("url")
+
     if qualidades_salvas:
         log(f"  Qualidade: {len(qualidades_salvas)} titulos/episodios com versao(oes) registrada(s)", "INFO")
 
@@ -1614,11 +1644,29 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
                 if _label_permite_precheck_titulo(label):
                     bkey = chave_nome_normalizada(nome_limpo)
                     if len(bkey) >= 8 and bkey in nomes_base_salvos:
-                        # Log debug
-                        log(f"  [PULO] Titulo '{nome_limpo}' ja na base.", "NAV")
+                        url_antiga = urls_por_nome_limpo.get(bkey)
+                        if url_antiga:
+                            log(f"  [PRE-CHECK] Testando URL antiga do titulo '{nome_limpo}'...", "NAV")
+                            if _validar_link_rapido(url_antiga):
+                                log(f"  [PULO] Titulo '{nome_limpo}' ja na base e link VIVO.", "NAV")
+                                continue
+                            else:
+                                log(f"  [DEAD LINK] URL de '{nome_limpo}' falhou! Removendo do skip para re-dumpear.", "WARN")
+                        else:
+                            log(f"  [PULO] Titulo '{nome_limpo}' ja na base.", "NAV")
+                            continue
+                            
+            # Precheck visual (pHash) para quando o nome e vazio/???
+            if (not nome_limpo or nome_limpo == "???") and card["phash"] != "sem_img" and _label_permite_precheck_titulo(label):
+                url_antiga = urls_por_phash.get(card["phash"])
+                if url_antiga:
+                    log(f"  [PRE-CHECK] Nome ??? mas pHash coincidiu! Testando URL...", "NAV")
+                    if _validar_link_rapido(url_antiga):
+                        log(f"  [PULO] Imagem reconhecida e link VIVO (Visual Skip).", "NAV")
                         continue
-                        
-            # Se chegou aqui, e alvo valido!
+                    else:
+                        log(f"  [DEAD LINK] URL (via pHash) falhou! Clicando para re-dumpear.", "WARN")
+# Se chegou aqui, e alvo valido!
             if card["nome"] == "???":
                 ocr = ler_nome_por_ocr(card["bounds"], img_tela)
                 if ocr:
@@ -1643,7 +1691,10 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
             "nome_ui": card_alvo["nome"].strip().lower()
         }
         
+        global _phash_ativo
+        _phash_ativo = card_alvo["phash"]
         processar_item(card_alvo)
+        _phash_ativo = None
         
         if detectar_tela(parse_xml(get_ui_xml())) != "lista":
             tap(tap_x, tap_y, delay=1.5)
