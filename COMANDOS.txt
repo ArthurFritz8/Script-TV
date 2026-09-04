@@ -41,3 +41,28 @@ Se um dia uma atualização do LDPlayer passar a pausar o áudio quando minimiza
 basta apertar `Win + Tab`, arrastar a janela do LDPlayer para o "Desktop 2", e 
 voltar a usar seu PC normalmente no "Desktop 1". O Windows achará que ele está 
 maximizado e não suspenderá a renderização!
+
+# ══════════════════════════════════════════════════════════════════════════════
+# O FLUXO NOTURNO DE MANUTENCAO CIRURGICA (Orquestracao)
+# ══════════════════════════════════════════════════════════════════════════════
+Para manter os links atualizados sem precisar redumpear o catalogo inteiro, 
+utilize o fluxo orquestrado noturno:
+
+1) O REVALIDADOR (Watchdog Mudo)
+   Verifica a validade de todos os links em background (sem abrir o emulador)
+   e registra os links mortos/suspeitos no "links_mortos.jsonl".
+   > python revalidar_links.py --loop-intervalo 60
+
+2) O ROBO EXTRATOR (Foco Cirurgico)
+   Com a flag --focar-mortos, o robo so abrira e extraira novamente os 
+   titulos marcados como caidos pelo revalidador, pulando todo o resto.
+   > python robo_extrator.py --focar-mortos
+
+3) A SINCRONIZACAO GIST (Playlist Final)
+   Re-gera a playlist completa usando o catalogo (agora com URLs renovadas)
+   e sobe a nova versao para o Gist (se configurado).
+   > python gerar_playlist_final.py --sincronizar
+
+Ciclo perfeito: O revalidador detecta os buracos -> O robo conserta apenas
+os buracos -> O gerador empacota tudo e atualiza o servidor.
+

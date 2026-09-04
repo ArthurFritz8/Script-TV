@@ -3,6 +3,27 @@ import urllib.request
 _phash_ativo = None
 urls_por_nome_limpo = {}
 urls_por_phash = {}
+_prioridade_urls_caidas = set()
+_urls_validadas_sessao = {}
+
+def carregar_sidecar_prioridade():
+    if not args.focar_mortos:
+        return
+    if not os.path.exists(os.path.join(LOG_DIR, "links_mortos.jsonl")):
+        return
+    with open(os.path.join(LOG_DIR, "links_mortos.jsonl"), "r", encoding="utf-8") as f:
+        for linha in f:
+            if not linha.strip(): continue
+            try:
+                reg = json.loads(linha)
+                if reg.get("status") in ["morto", "suspeito"]:
+                    # A chave e a URL_KEY original, mas queremos comparar com a URL que mapeamos no catalogo
+                    # Nao temos a URL exata, mas podemos usar o url_key pra mapear
+                    _prioridade_urls_caidas.add(reg.get("url_key"))
+            except:
+                pass
+    log(f"  Foco Ativo: {len(_prioridade_urls_caidas)} links prioritarios (mortos/suspeitos) p/ renovar.", "INFO")
+
 
 def _validar_link_rapido(url):
     if not url or not url.startswith('http'):
@@ -418,6 +439,12 @@ def salvar(url, nome_tela=None, aba=""):
             log(f"  [DUP] Nome ja salvo: {nome_exibicao}", "WARN")
             return False
 
+        # Detectar se e uma renovacao atômica
+        if chave_nome in nomes_salvos or (chave_versao and chave_versao in qualidades_salvas):
+            url_antiga = urls_por_nome_limpo.get(chave_nome)
+            if url_antiga and url_antiga != url and url.startswith("http"):
+                log(f"  [RENOVACAO] {url_antiga} -> {url}", "OK")
+                
         gravar_m3u(cat, grupo, nome_exibicao, url)
         gravar_catalogo(url, url_key, tipo, cat, grupo, nome_exibicao, meta, aba)
 
@@ -441,6 +468,7 @@ def salvar(url, nome_tela=None, aba=""):
         return True
 
 def carregar_playlists_existentes():
+    carregar_sidecar_prioridade()
     carregados = 0
     for fname in os.listdir(LOG_DIR):
         if not fname.endswith(".m3u"):
@@ -1646,12 +1674,16 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
                     if len(bkey) >= 8 and bkey in nomes_base_salvos:
                         url_antiga = urls_por_nome_limpo.get(bkey)
                         if url_antiga:
-                            log(f"  [PRE-CHECK] Testando URL antiga do titulo '{nome_limpo}'...", "NAV")
-                            if _validar_link_rapido(url_antiga):
-                                log(f"  [PULO] Titulo '{nome_limpo}' ja na base e link VIVO.", "NAV")
-                                continue
+                            ukey = chave_url(url_antiga)
+                            if args.focar_mortos and ukey in _prioridade_urls_caidas:
+                                log(f"  [PRIORIDADE] '{nome_limpo}' esta no sidecar de mortos! Forcando clique...", "WARN")
                             else:
-                                log(f"  [DEAD LINK] URL de '{nome_limpo}' falhou! Removendo do skip para re-dumpear.", "WARN")
+                                log(f"  [PRE-CHECK] Testando URL antiga do titulo '{nome_limpo}'...", "NAV")
+                                if _validar_link_rapido(url_antiga):
+                                    log(f"  [PULO] Titulo '{nome_limpo}' ja na base e link VIVO.", "NAV")
+                                else:
+                                    log(f"  [SUSPEITO] URL falhou no HEAD, mas mantendo o pulo (evita falso negativo).", "NAV")
+                                continue
                         else:
                             log(f"  [PULO] Titulo '{nome_limpo}' ja na base.", "NAV")
                             continue
@@ -1660,12 +1692,16 @@ def _processar_lista_cards(cards, label, tap_x, tap_y, scroll_n):
             if (not nome_limpo or nome_limpo == "???") and card["phash"] != "sem_img" and _label_permite_precheck_titulo(label):
                 url_antiga = urls_por_phash.get(card["phash"])
                 if url_antiga:
-                    log(f"  [PRE-CHECK] Nome ??? mas pHash coincidiu! Testando URL...", "NAV")
-                    if _validar_link_rapido(url_antiga):
-                        log(f"  [PULO] Imagem reconhecida e link VIVO (Visual Skip).", "NAV")
-                        continue
+                    ukey = chave_url(url_antiga)
+                    if args.focar_mortos and ukey in _prioridade_urls_caidas:
+                        log(f"  [PRIORIDADE] pHash coincidente esta no sidecar de mortos! Forcando clique...", "WARN")
                     else:
-                        log(f"  [DEAD LINK] URL (via pHash) falhou! Clicando para re-dumpear.", "WARN")
+                        log(f"  [PRE-CHECK] Nome ??? mas pHash coincidiu! Testando URL...", "NAV")
+                        if _validar_link_rapido(url_antiga):
+                            log(f"  [PULO] Imagem reconhecida e link VIVO (Visual Skip).", "NAV")
+                        else:
+                            log(f"  [SUSPEITO] URL (via pHash) falhou no HEAD, mas mantendo pulo.", "NAV")
+                        continue
 # Se chegou aqui, e alvo valido!
             if card["nome"] == "???":
                 ocr = ler_nome_por_ocr(card["bounds"], img_tela)
@@ -2099,6 +2135,10 @@ if __name__ == "__main__":
         "--modo-noturno", action="store_true",
         help="Relatorio extremamente compacto ao final. Requer Desktops Virtuais ou nao minimizar."
     )
+    _parser.add_argument(
+        "--focar-mortos", action="store_true",
+        help="Foca apenas nos links identificados como mortos/suspeitos no links_mortos.jsonl"
+    )
     args = _parser.parse_args()
     abas_selecionadas = list(ABAS_DISPONIVEIS.keys()) if "todas" in args.abas else args.abas
 
@@ -2141,6 +2181,7 @@ if __name__ == "__main__":
     log("Emulador conectado!", "OK")
 
     carregar_playlists_existentes()
+    carregar_sidecar_prioridade()
     carregar_estado_visitados()
     carregar_qualidades_salvas()
     iniciar_app_limpo()

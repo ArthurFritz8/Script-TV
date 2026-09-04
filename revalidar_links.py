@@ -123,6 +123,7 @@ def processar_item(item, db_entry_existente):
 def main():
     parser = argparse.ArgumentParser(description="Revalida links M3U8 do catalogo.")
     parser.add_argument("--incluir-ao-vivo", action="store_true", help="Revalidar Canais_AoVivo tambem (padrao: pular)")
+    parser.add_argument("--loop-intervalo", type=int, default=0, help="Minutos para esperar e rodar de novo em loop (padrao: 0 = roda so uma vez)")
     args = parser.parse_args()
 
     print("Carregando catalogo e base de mortos...")
@@ -151,55 +152,68 @@ def main():
     if not itens_para_checar:
         return
 
-    # Execucao multi-thread
-    futuros = {}
-    novo_sidecar = {}
-    checados_agora = 0
+    while True:
+
+        # Execucao multi-thread
+        futuros = {}
+        novo_sidecar = {}
+        checados_agora = 0
     
-    print("Iniciando validacao HTTP (isso pode demorar varios minutos)...")
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        for item in itens_para_checar:
-            uk = item.get("url_key")
-            f = executor.submit(processar_item, item, sidecar_db.get(uk))
-            futuros[f] = item
+        print("Iniciando validacao HTTP (isso pode demorar varios minutos)...")
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            for item in itens_para_checar:
+                uk = item.get("url_key")
+                f = executor.submit(processar_item, item, sidecar_db.get(uk))
+                futuros[f] = item
             
-        for f in as_completed(futuros):
-            uk, estado, checou_realmente = f.result()
+            for f in as_completed(futuros):
+                uk, estado, checou_realmente = f.result()
             
-            # Se ainda estiver "vivo", nao precisamos manter no sidecar (pra economizar espaco)
-            # MAS se quisermos preservar a ultima_checagem, temos que salvar. Vamos salvar todos.
-            novo_sidecar[uk] = estado
+                # Se ainda estiver "vivo", nao precisamos manter no sidecar (pra economizar espaco)
+                # MAS se quisermos preservar a ultima_checagem, temos que salvar. Vamos salvar todos.
+                novo_sidecar[uk] = estado
             
-            cat = estado["categoria"]
-            if estado["status"] == "vivo":
-                estatisticas[cat]["vivos"] += 1
-            elif estado["status"] == "suspeito":
-                estatisticas[cat]["suspeitos"] += 1
-            elif estado["status"] == "morto":
-                estatisticas[cat]["mortos"] += 1
+                cat = estado["categoria"]
+                if estado["status"] == "vivo":
+                    estatisticas[cat]["vivos"] += 1
+                elif estado["status"] == "suspeito":
+                    estatisticas[cat]["suspeitos"] += 1
+                elif estado["status"] == "morto":
+                    estatisticas[cat]["mortos"] += 1
                 
-            if checou_realmente:
-                checados_agora += 1
-                if checados_agora % 50 == 0:
-                    print(f"  ... progresso: {checados_agora} requests efetuados")
+                if checou_realmente:
+                    checados_agora += 1
+                    if checados_agora % 50 == 0:
+                        print(f"  ... progresso: {checados_agora} requests efetuados")
 
-    print("Salvando sidecar de forma atomica...")
-    salvar_sidecar_atomico(novo_sidecar)
+        print("Salvando sidecar de forma atomica...")
+        salvar_sidecar_atomico(novo_sidecar)
     
-    print("\n" + "="*50)
-    print(" RELATORIO DE REVALIDACAO ")
-    print("="*50)
+        print("\n" + "="*50)
+        print(" RELATORIO DE REVALIDACAO ")
+        print("="*50)
     
-    for cat, stats in estatisticas.items():
-        print(f"[{cat}] Total: {stats['total']} | Vivos: {stats['vivos']} | Suspeitos: {stats['suspeitos']} | Mortos: {stats['mortos']} | Ignorados: {stats['ignorados']}")
+        for cat, stats in estatisticas.items():
+            print(f"[{cat}] Total: {stats['total']} | Vivos: {stats['vivos']} | Suspeitos: {stats['suspeitos']} | Mortos: {stats['mortos']} | Ignorados: {stats['ignorados']}")
         
-        checa_valido = stats['total'] - stats['ignorados']
-        if checa_valido > 10 and stats['mortos'] > (checa_valido * 0.3):
-            print(f"  -> [ALERTA] Mais de 30% dos links de {cat} confirmados como MORTOS!")
-            print(f"  -> [ALERTA] Forte indicio de que o APP trocou de servidor/CDN.")
-            print(f"  -> [ALERTA] RECOMENDACAO: Re-extrair este catalogo pelo emulador.")
+            checa_valido = stats['total'] - stats['ignorados']
+            if checa_valido > 10 and stats['mortos'] > (checa_valido * 0.3):
+                print(f"  -> [ALERTA] Mais de 30% dos links de {cat} confirmados como MORTOS!")
+                print(f"  -> [ALERTA] Forte indicio de que o APP trocou de servidor/CDN.")
+                print(f"  -> [ALERTA] RECOMENDACAO: Re-extrair este catalogo pelo emulador.")
 
-    print("\nExecucao finalizada com sucesso.")
+        print("\nExecucao finalizada com sucesso.")
+        if args.loop_intervalo > 0:
+            import datetime
+            proxima = datetime.datetime.now() + datetime.timedelta(minutes=args.loop_intervalo)
+            print(f"\nProxima varredura em {args.loop_intervalo} min ({proxima.strftime('%H:%M')}). Aguardando...")
+            time.sleep(args.loop_intervalo * 60)
+            
+            # Recarregar sidecar para ter certeza que pegamos alteracoes
+            sidecar_db = carregar_sidecar()
+        else:
+            break
+
 
 if __name__ == "__main__":
     main()
